@@ -20,6 +20,21 @@ removals, default changes and the supported replacement workflow.
   `manual` line and now also carries `tool: "create_custom_drc_rule"` and `arguments:
   {board, rules, replace_existing: true}`, so a caller can run it without reading the
   prose. `plan_convergent_placement` refuses a board that has an open full flow.
+## Unreleased: `delete_all_routing`'s apply checkpoints first (Row BS, follow-up)
+
+**Additive.** `delete_all_routing` with `dry_run: false` now gets the automatic
+checkpoint of board safety (below): before it deletes, the project's saved files are
+checkpointed (label `automatic: before delete_all_routing`), or an identical checkpoint
+is reused, and the result carries `live_project`. A checkpoint that cannot be made (for
+example a project over the checkpoint limits, 256 MB or 4096 files), or no
+`<board>.kicad_pro`, refuses the apply (`plan_blocked`) and nothing is deleted; before,
+the apply ran on any project. The checkpoint comes before the tool's own argument checks,
+so such a refusal is reported before, say, a missing `expected_plan_revision`. As a
+live-only tool it takes no checkpoint where KiCad does not hold the board or cannot be
+seen to; it refuses there on its own. The preview (`dry_run` missing or `true`) is
+unchanged: no checkpoint, no `live_project`. A result with `status: "noop"` (an apply on a
+board with nothing to delete) gets a `live_project.summary` that says nothing changed and
+offers no Undo, for every tool on the list.
 
 ## Unreleased: `delete_all_routing`, one call for all routing (Row DR)
 
@@ -76,7 +91,8 @@ step. Before it, a board that `export_specctra_dsn` refused for unlocked routing
   KiCad, open the board there and call again". Neither claims the board is
   closed. Error kinds and which calls refuse are unchanged; only message text
   changed.
-- **`set_component_placements` and `apply_specctra_ses` checkpoint first.** Before
+- **`set_component_placements` and `apply_specctra_ses` checkpoint first** (and
+  `delete_all_routing`'s apply, since the follow-up above). Before
   the tool runs, the project's saved files are checkpointed (`create_checkpoint`'s
   store, `reason` `automatic`, label `automatic: before <tool>`); a checkpoint whose
   files are exactly the saved files now, and whose stored copies still read back,

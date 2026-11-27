@@ -1874,7 +1874,7 @@ impl Calls<'_> {
         )?;
         self.files.push(file.display().to_string());
         Ok(match outcome {
-            Outcome::Succeeded => Ok(body),
+            Outcome::Succeeded | Outcome::Unchanged => Ok(body),
             Outcome::Failed => Err(Halt::Failed(format!("{tool} refused: {}", short(&body)))),
             Outcome::MayHaveChanged => Err(Halt::MayHaveChanged(format!(
                 "{tool} may have changed the board: {}",

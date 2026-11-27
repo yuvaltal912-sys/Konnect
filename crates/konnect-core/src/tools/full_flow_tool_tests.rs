@@ -1365,3 +1365,30 @@ fn a_route_with_only_the_reference_group_has_no_plane_stitching() {
     assert!(follow.plane.is_none());
     assert_eq!(follow.reference.as_ref().unwrap()[0]["step"], 9);
 }
+
+#[test]
+fn a_noop_result_is_a_success_for_the_flow() {
+    let noop = Called::Answered(CallToolResult::json(&json!({ "status": "noop" })));
+    assert_eq!(outcome_of_call(&noop, true), Outcome::Unchanged);
+}
+
+/// #131: `delete_all_routing`'s apply takes B's checkpoint too. F's own checkpoint before
+/// L2 holds the same saved files, so the guard reuses it: one checkpoint, not two.
+#[test]
+fn the_guards_checkpoint_after_the_flows_is_the_same_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = dir.path().join("board.kicad_pcb");
+    std::fs::write(&board, BOARD_TEXT).unwrap();
+    std::fs::write(board.with_extension("kicad_pro"), "{}").unwrap();
+    let project = board.with_extension("kicad_pro");
+    let flow =
+        crate::tools::checkpoints::ensure_checkpoint(&project, "full flow: before L2").unwrap();
+    let guard = crate::tools::checkpoints::ensure_checkpoint(
+        &project,
+        &crate::tools::board_safety::checkpoint_label("delete_all_routing"),
+    )
+    .unwrap();
+    assert!(flow.made_now);
+    assert_eq!(guard.id, flow.id);
+    assert!(!guard.made_now);
+}

@@ -297,11 +297,12 @@ an unproved outline is not completion evidence.
   sit on the edge. `run_design_review`, `audit_manufacturing` and
   `validate_for_manufacturing` run the same containment check on courtyards,
   pads and silkscreen text.
-- `set_component_placements` and `apply_specctra_ses` checkpoint the project's
-  saved files themselves before they run (reusing one that holds exactly those
-  files). Tell the user **live_project.summary**: it says the real project was
-  edited, which checkpoint restores it, and whether unsaved changes in KiCad are
-  outside it. A refusal that says the board is not open in KiCad's PCB editor
+- `set_component_placements`, `apply_specctra_ses` and the apply of
+  `delete_all_routing` (not its preview) checkpoint the project's saved files
+  themselves before they run (reusing one that holds exactly those files).
+  Tell the user **live_project.summary**: it says the real project was edited,
+  which checkpoint restores it, and whether unsaved changes in KiCad are outside
+  it. A refusal that says the board is not open in KiCad's PCB editor
   means: ask the user to open that board, then call again. Pass
   `require_live_board: false` to `route_specctra_dsn` only when the user wants to
   route the saved board without KiCad.
