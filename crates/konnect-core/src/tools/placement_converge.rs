@@ -86,8 +86,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          names the running id. A finished run's result stays in its run folder, so \
          `run_id` reads it later too, after a server restart. A call with `run_id` needs \
          neither KiCad nor the board open. A run that failed is `status: failed` with its \
-         `error`, and one whose server stopped before it ended is `status: interrupted`; \
-         both are error results. \
+         `error` (a server that stops ends its runs this way); one whose server was killed \
+         before it ended is `status: interrupted`. Both are error results. \
          Read-only: nothing on the board changes. The board must be open in KiCad, and the \
          only board open: its live text and KiCad's own routing rules are read at the start \
          (twice, and both reads must agree). Every footprint KiCad marks locked stays where \

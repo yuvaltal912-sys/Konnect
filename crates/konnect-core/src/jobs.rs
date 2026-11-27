@@ -274,11 +274,12 @@ pub(crate) fn claim_board(
         let busy = holder(state, kind, &body_path);
         // A holder that names no run may be another process's `board_busy`, which holds
         // the lock for a moment only: one more try after it.
-        if busy.run_id.is_some() || {
-            std::thread::sleep(Duration::from_millis(20));
-            !take(&lock)?
-        } {
+        if busy.run_id.is_some() {
             return Ok(Err(busy));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        if !take(&lock)? {
+            return Ok(Err(holder(state, kind, &body_path)));
         }
     }
     write_json(
@@ -308,16 +309,19 @@ struct Active {
     stop: Arc<watch::Sender<bool>>,
 }
 
-/// The runs of this process that have not ended, by folder. Cloning shares them.
+/// The runs of this process that have not ended, by folder, and whether the process is
+/// stopping them. Cloning shares both.
 #[derive(Clone, Default)]
 pub(crate) struct Jobs {
     active: Arc<Mutex<BTreeMap<PathBuf, Arc<Active>>>>,
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What a run's task leaves when it ends, however it ends (an unwind too): the stop of
-/// its work, so no work outlives its run's locks; the locks, so the board is free once
-/// the run reads as ended; then the registry entry; then the signal that wakes the
-/// reports that wait.
+/// its work (which takes effect at the work's next await, after a CPU-bound phase; the
+/// work writes only below its own run folder meanwhile); the locks, so the board is
+/// free once the run reads as ended; then the registry entry; then the signal that
+/// wakes the reports that wait.
 struct Leave {
     stop: Arc<watch::Sender<bool>>,
     held: Option<(BoardClaim, File)>,
@@ -362,6 +366,8 @@ where
     let answer = runtime.block_on(async move {
         let mut task = tokio::spawn(work);
         tokio::select! {
+            // A work that has ended keeps its answer, even when the stop came with it.
+            biased;
             joined = &mut task => joined.map_err(|join| match join.try_into_panic() {
                 Ok(payload) => format!("the run panicked: {}", panic_text(&*payload)),
                 Err(join) => format!("the run stopped: {join}"),
@@ -430,6 +436,9 @@ impl Jobs {
     where
         W: Future<Output = anyhow::Result<Value>> + Send + 'static,
     {
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("the Konnect server is stopping, so no new run starts: call again once it has restarted");
+        }
         let lock_path = folder.join(LOCK_FILE);
         let run_lock = File::create(&lock_path)
             .map_err(|error| anyhow::anyhow!("create '{}': {error}", lock_path.display()))?;
@@ -538,6 +547,9 @@ impl Jobs {
     /// end (`failed`, [`STOPPED`]). A run in a CPU-bound phase ends that phase first;
     /// one that has not ended by then reads as interrupted once the process is gone.
     pub(crate) async fn stop_all(&self, grace: Duration) {
+        // No start after this one: a run started now would not be stopped.
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let active: Vec<Arc<Active>> = self.lock().values().cloned().collect();
         for run in &active {
             let _ = run.stop.send(true);

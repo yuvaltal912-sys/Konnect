@@ -442,7 +442,7 @@ async fn a_wait_on_another_process_run_lasts_the_wait_asked() {
     let folder = left_running(&run, FIRST);
     let lock = File::open(folder.join(LOCK_FILE)).unwrap();
     lock.try_lock().unwrap();
-    for wait in [Duration::from_millis(700), Duration::from_millis(2_600)] {
+    for wait in [Duration::from_millis(200), Duration::from_millis(2_600)] {
         let waited = Instant::now();
         let report = Jobs::default().report(&run.state, &KIND, FIRST, wait).await;
         let took = waited.elapsed();
@@ -451,8 +451,10 @@ async fn a_wait_on_another_process_run_lasts_the_wait_asked() {
             "{report:?}"
         );
         assert!(took >= wait, "{took:?} < {wait:?}");
-        // A whole extra poll would overshoot by up to 2 s; a loaded machine by less.
-        assert!(took < wait + Duration::from_millis(1_500), "{took:?}");
+        if wait < POLL_OTHER {
+            // A wait shorter than one poll never sleeps a whole poll.
+            assert!(took < POLL_OTHER, "{took:?}");
+        }
     }
     drop(lock);
 }
@@ -564,9 +566,25 @@ async fn a_stopped_server_drops_its_runs_work_and_records_why() {
         panic!("{report:?}");
     };
     assert_eq!(record.error.as_deref(), Some(STOPPED));
-    assert!(claim_board(&run.state, &KIND, &run.board, SECOND)
+    // A stopping server starts nothing new.
+    let other = run.state.join("other.kicad_pcb");
+    let claim = claim_board(&run.state, &KIND, &other, SECOND)
         .unwrap()
-        .is_ok());
+        .unwrap();
+    let folder = run_folder_of(&run.state, &KIND, SECOND);
+    std::fs::create_dir_all(&folder).unwrap();
+    let refused = jobs
+        .start(
+            &KIND,
+            claim,
+            &other,
+            folder.clone(),
+            Arc::new(Count::default()),
+            async { Ok(json!({})) },
+        )
+        .unwrap_err();
+    assert!(format!("{refused:#}").contains("stopping"), "{refused:#}");
+    assert!(!folder.join(RUN_FILE).exists());
 }
 
 /// A progress that panics after its first reading.

@@ -225,51 +225,59 @@ async fn main() -> Result<()> {
         info!("simulation is off (simulation_enabled = false): its toolset is not served");
     }
 
-    match config.transport {
-        TransportMode::Stdio => {
-            handler.enable_stdio_reload();
-            match transport::stdio::run_stdio(handler).await? {
-                transport::stdio::StdioExit::Eof => {}
-                #[cfg(unix)]
-                transport::stdio::StdioExit::Reload(plan) => {
-                    // Neither exec nor the process's end runs a background run's
-                    // destructors: stop the runs first, so no router is left behind.
-                    konnect_core::stop_background_runs(RUNS_GRACE).await;
-                    // exec does not run destructors. Release the old process's
-                    // run-registry pair explicitly so the replacement can
-                    // register the same PID without leaving stale state.
-                    drop(_run_record);
-                    exec_reload(plan)?;
+    // Every way out of the transports, an error too, goes past the stop of the background
+    // runs below.
+    let served: Result<()> = async {
+        match config.transport {
+            TransportMode::Stdio => {
+                handler.enable_stdio_reload();
+                match transport::stdio::run_stdio(handler).await? {
+                    transport::stdio::StdioExit::Eof => {}
+                    #[cfg(unix)]
+                    transport::stdio::StdioExit::Reload(plan) => {
+                        // Neither exec nor the process's end runs a background run's
+                        // destructors: stop the runs first, so no router is left behind.
+                        konnect_core::stop_background_runs(RUNS_GRACE).await;
+                        // exec does not run destructors. Release the old process's
+                        // run-registry pair explicitly so the replacement can
+                        // register the same PID without leaving stale state.
+                        drop(_run_record);
+                        exec_reload(plan)?;
+                    }
+                }
+            }
+            TransportMode::Http => {
+                transport::http::run_http(handler, &config.http_address).await?;
+            }
+            TransportMode::Both => {
+                let handler_http = handler.clone();
+                let http_addr = config.http_address.clone();
+                let http_task = tokio::spawn(async move {
+                    transport::http::run_http(handler_http, &http_addr)
+                        .await
+                        .expect("HTTP transport failed");
+                });
+                let stdio_task = tokio::spawn(async move {
+                    transport::stdio::run_stdio(handler)
+                        .await
+                        .expect("STDIO transport failed");
+                });
+                tokio::select! {
+                    _ = http_task => {},
+                    _ = stdio_task => {},
                 }
             }
         }
-        TransportMode::Http => {
-            transport::http::run_http(handler, &config.http_address).await?;
-        }
-        TransportMode::Both => {
-            let handler_http = handler.clone();
-            let http_addr = config.http_address.clone();
-            let http_task = tokio::spawn(async move {
-                transport::http::run_http(handler_http, &http_addr)
-                    .await
-                    .expect("HTTP transport failed");
-            });
-            let stdio_task = tokio::spawn(async move {
-                transport::stdio::run_stdio(handler)
-                    .await
-                    .expect("STDIO transport failed");
-            });
-            tokio::select! {
-                _ = http_task => {},
-                _ = stdio_task => {},
-            }
-        }
+        Ok(())
     }
+    .await;
 
     // A background run (plan_convergent_placement) lives on a thread of its own, whose
     // router processes the end of the process would leave running: stop them first.
+    // A signal that kills the process (SIGTERM, SIGKILL) skips this, as it skips every
+    // destructor; Konnect installs no signal handler.
     konnect_core::stop_background_runs(RUNS_GRACE).await;
-    Ok(())
+    served
 }
 
 /// Replace the standalone process through the platform-specific validated

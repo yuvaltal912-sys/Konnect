@@ -280,8 +280,9 @@ an unproved outline is not completion evidence.
   on the same board is refused and names the running id: report that run instead.
   A report call needs neither KiCad nor the board open. The result stays in the run
   folder, so the same call reads it later, after a server restart too. **status**
-  `failed` (with its **error**) or `interrupted` (the server stopped before the run
-  ended) carries no plan: tell the user and start a new run. Show the user
+  `failed` (with its **error**; a server that stopped ends its runs so) or
+  `interrupted` (the server was killed before the run ended) carries no plan: tell
+  the user and start a new run. Show the user
   **winner**, **candidates** and **notes**; only on
   their explicit OK call `create_checkpoint`, then `set_component_placements` with
   **apply_with.arguments** exactly as returned: the plan is legal as a whole, so it

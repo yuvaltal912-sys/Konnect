@@ -35,9 +35,12 @@ its result was lost.
   malformed `run_id` is an argument error. A report call needs neither KiCad nor the
   board open.
 - **No synchronous mode** and no cancel call: no caller needs either. A board's run
-  ends by its own stop rules. A server that ends (its stdio closed, or a reload)
-  stops its runs first, so their router processes are killed rather than left
-  running; such a run reads `status: failed` with `error` saying the server stopped.
+  ends by its own stop rules. A server that ends (its stdio closed or failed, or a
+  reload) stops its runs first and starts no new one, so their router processes are
+  killed rather than left running; such a run reads `status: failed` with `error`
+  saying the server stopped. A signal that kills the server (SIGTERM, SIGKILL) skips
+  that, as before this change: Konnect installs no signal handler, and an HTTP-only
+  server ends only so. Its run then reads `status: interrupted`.
 - **Migration:** after a start, call again with `{"run_id": ..., "wait_s": 300}`
   until `status` is not `running`, then read the result as before.
 
