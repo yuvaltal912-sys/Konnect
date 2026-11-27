@@ -1,7 +1,9 @@
 # Offloading test runs to the BGU HPC cluster
 
 Status 2026-11-27: working. Four real jobs ran on the cluster on 2026-11-27 (jobs 20894, 20895,
-20896 and 20898, all on `hpc-node5`); the measured values below come from them. Values still
+20896 and 20898, all on `hpc-node5`); the measured values below come from them. Their records are
+in the main checkout's `target/hpc-runs/` (20896, the one-off `cargo-mutants` install, has no
+record folder; its times come from `sacct`). Values still
 marked *unmeasured* are not settled by those runs. `scripts/hpc/selftest.sh` also runs the
 scripts against a fake cluster on the Mac (no cargo, no network), and each guard was broken once
 to check that the self-test catches it.
@@ -109,17 +111,18 @@ Measured on the cluster, 2026-11-27 (16 CPUs, 16 GB, `hpc-node5`, x86_64):
 | Cost | Value |
 |---|---|
 | Upload | a 12 MB git bundle (the whole history), seconds over the VPN |
-| Preparation on the login node | about 5 minutes the first time (installing Rust 1.96.0 and fetching every crate); 4 seconds after that |
-| Queue wait | none: all four jobs started the second they were submitted (one afternoon; a busy week may differ) |
+| Preparation on the login node | about 5 minutes the first time (installing Rust 1.96.0 and fetching every crate); 4 seconds after that (run folder created to `sacct`'s submit time) |
+| Queue wait | none: `sacct` gives the same submit and start time for all four jobs (one afternoon; a busy week may differ) |
 | `konnect-sexp` tests (`--lib`) | 168 s cold, including its build; 32 s warm. 227 passed, 2 ignored |
 | `konnect-core` cold build plus the `place_converge` tests | 245 s for the step, of which the tests took 77 s |
 | `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4` | 42 mutants in 6 minutes |
-| `target/` after those runs | 2.3 GB |
+| `target/` after those runs | 2.3 GB (`du`, read over ssh after job 20898) |
 | Disk | the home folder is on a shared 166 TB file system with 112 TB free; `quota` reports no user quota. The node's `/tmp` has 59 GB free |
 | Network from the compute node | reaches crates.io |
 
 *Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, a mutants batch at the
-size of a PR's (100 or more mutants), and the queue at busy times.
+size of a PR's (100 or more mutants), the queue at busy times, and the two example plans exactly as
+committed (`first-probe.plan` with its `--skip`, `mutants-probe.plan` with its last check).
 
 Expected gain (*unmeasured* end to end): a mutants batch leaves the Mac's lane altogether, which
 is 20 to 60 minutes of `instr.lock` per batch that gates no longer wait behind. With the 1-job quota,
@@ -168,13 +171,18 @@ Mac: hpc-status (squeue, sacct, progress)     Mac: hpc-fetch (logs back, evidenc
   bit-exact costs recorded on the Mac (aarch64). On the cluster (x86_64) one intermediate cost
   differs by 8 ulp; the end cost and the board are identical. It is a platform difference, not a
   bug: Linux plans skip it (`-- --skip place_converge::tests::whole_runs_are_the_recorded_goldens`),
-  and the macOS gate still runs it.
+  and the macOS gate still runs it. The skip itself has not run on the cluster yet.
 - **Build needs.** `konnect-core` builds nng (cmake and a C compiler; the container has gcc 11.3
   and cmake 3.24.1) and the IPC protos. The container's `protoc` is 3.12.4, which rejects the
   protos' proto3 `optional` fields. So `prepare.sh` installs protoc 36.2 under
   `konnect-hpc/tools/protoc/` when it is missing or another version: it downloads the release zip
   from GitHub, checks its SHA-256 against the digest GitHub publishes for that asset (pinned in
-  `scripts/hpc/common.sh`), and refuses a mismatch. `run-plan.sh` puts it on `PROTOC`.
+  `scripts/hpc/common.sh`), and refuses a mismatch. `run-plan.sh` puts it on `PROTOC`. The
+  protoc 36.2 the jobs used was installed by hand the same way; this install step was not part of
+  those jobs. Its pieces were checked on the login node instead (`curl` reaches GitHub, the
+  digest matches, `unzip` is there, the zip has `bin/protoc` and `include/`, and it reports
+  `libprotoc 36.2`), and the self-test covers the step itself. An installed `protoc` that reports
+  36.2 is kept as it is: its version is checked, not its digest.
 
 ### Plans
 
@@ -204,7 +212,9 @@ any                mutants  cargo mutants -p konnect-core --file crates/konnect-
 ```
 
 Two example plans are in `scripts/hpc/plans/`: `first-probe.plan` (tools, disk and network on the
-node, then two focused test runs) and `mutants-probe.plan` (one file's mutants).
+node, then two focused test runs) and `mutants-probe.plan` (one file's mutants). An `any` step
+reads `recorded(exit N)` for every non-zero exit, so a mutants plan ends with a `pass` step that
+checks that at least one mutant was tested; without it a red baseline would look green.
 
 `hpc-fetch` ends `evidence.txt` with one line: `ALL STEPS AS EXPECTED`, `NOT AS EXPECTED`,
 `INCOMPLETE` (steps missing: wall time or a crash), `NOT CLEAN` (every step as expected but Slurm

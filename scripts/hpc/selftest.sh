@@ -63,7 +63,7 @@ EOF
 cat >"$F/bin/curl" <<EOF
 #!/bin/bash
 while [ \$# -gt 0 ]; do case "\$1" in -o) out=\$2; shift 2;; -*) shift;; *) url=\$1; shift;; esac; done
-echo "\$url" >> "$F/state/curl-calls"; cp "$F/protoc.zip" "\$out"
+echo "\$url" >> "$F/state/curl-calls"; [ -e "$F/state/no-download" ] && exit 22; cp "$F/protoc.zip" "\$out"
 EOF
 mkdir -p "$F/zip/bin" "$F/zip/include"
 printf '#!/bin/bash\necho "libprotoc 36.2"\n' >"$F/zip/bin/protoc"
@@ -133,6 +133,8 @@ touch "$F/state/no-toolchain"
 check "submit runs, installs the pinned toolchain" 0 "submitted: job" "$sub" "$F/plan/mixed.plan"
 grep -q "installing Rust 1.96.0" "$F/out" && { ok=$((ok + 1)); echo "ok    toolchain install logged"; } || { bad=$((bad + 1)); echo "FAIL  toolchain install not logged"; }
 grep -q "installing protoc 36.2" "$F/out" && [ -x "$F/remote/tools/protoc/bin/protoc" ] && { ok=$((ok + 1)); echo "ok    protoc installed"; } || { bad=$((bad + 1)); echo "FAIL  protoc not installed"; }
+[ "$(cat "$F/state/curl-calls")" = "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip" ] &&
+    { ok=$((ok + 1)); echo "ok    protoc from the official release URL"; } || { bad=$((bad + 1)); echo "FAIL  protoc URL: $(cat "$F/state/curl-calls")"; }
 check "fetch: control caught"     0 "caught  *fail  *101 .* ok  *x::guard$" "$fetch"
 check "fetch: named test caught"  0 "named  *fail  *101 .* ok  *x::guard$" "$fetch"
 check "fetch: other test failed"  0 "wrongtest  *fail  *101 .* WRONG-TEST " "$fetch"
@@ -176,7 +178,13 @@ check "protoc present: no second download" 0 "prepare: protoc 36.2$" "$sub" --cm
 [ "$(wc -l <"$F/state/curl-calls")" = "$calls" ] && { ok=$((ok + 1)); echo "ok    protoc not downloaded again"; } || { bad=$((bad + 1)); echo "FAIL  protoc downloaded again"; }
 printf '#!/bin/bash\necho "libprotoc 3.12.4"\n' >"$F/remote/tools/protoc/bin/protoc"
 check "old protoc replaced" 0 "installing protoc 36.2" "$sub" --cmd true
-"$F/remote/tools/protoc/bin/protoc" --version | grep -q "36.2" && { ok=$((ok + 1)); echo "ok    old protoc now 36.2"; } || { bad=$((bad + 1)); echo "FAIL  old protoc kept"; }
+"$F/remote/tools/protoc/bin/protoc" --version | grep -q "36.2" && [ ! -e "$F/remote/tools/protoc.old" ] && { ok=$((ok + 1)); echo "ok    old protoc now 36.2, nothing left over"; } || { bad=$((bad + 1)); echo "FAIL  old protoc kept or protoc.old left"; }
+printf '#!/bin/bash\necho "libprotoc 3.12.4"\n' >"$F/remote/tools/protoc/bin/protoc"
+touch "$F/state/no-download"
+check "failed protoc download refused" 1 "prepare failed" "$sub" --cmd true
+rm -f "$F/state/no-download"
+"$F/remote/tools/protoc/bin/protoc" --version | grep -q "3.12.4" && [ ! -d "$F/remote/run.lock" ] &&
+    { ok=$((ok + 1)); echo "ok    failed download: old protoc kept, lock released"; } || { bad=$((bad + 1)); echo "FAIL  failed download: protoc changed or lock left"; }
 rm -rf "${F:?}/remote/tools/protoc"
 HPC_PROTOC_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
     check "protoc zip with a wrong digest refused" 1 "prepare failed" "$sub" --cmd true

@@ -288,7 +288,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 
 `scripts/hpc/hpc-submit` sends one commit and a plan of test steps to the BGU HPC cluster as one Slurm job; `hpc-status` and `hpc-fetch` follow it and write `evidence.txt`. Use it for `cargo mutants` batches, negative-control batches and Linux test runs, so they leave the Mac's `instr.lock`. The macOS gate, KiCad, `kicad-cli` and fastroute stay on the Mac. Everything else, measured values included, is in [`HPC_OFFLOAD.md`](HPC_OFFLOAD.md).
 
-**Verified:** four real jobs on 2026-11-27 (20894, 20895, 20896, 20898) and the fake-cluster self-test. **Next step:** the owner approves the PR text, then push and open the PR. Done when the PR is open with that text.
+**Verified:** four real jobs on 2026-11-27 (20894, 20895, 20896, 20898) and the fake-cluster self-test. **Not verified on the cluster:** the automatic protoc install (its pieces were checked on the login node) and the two example plans exactly as committed. **Next step:** the owner approves the PR text, then push and open the PR. Done when the PR is open with that text.
 
 ## Row HS, the honest summaries (2026-11-27)
 

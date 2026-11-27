@@ -108,7 +108,7 @@ if [ "$("$PROTOC_DIR/bin/protoc" --version 2>/dev/null || true)" != "$want_proto
     heartbeat
     dl="$RUN/protoc-download" # inside the run folder: a failure's cleanup removes it
     mkdir -p "$dl"
-    curl -fsSL --retry 2 -o "$dl/protoc.zip" \
+    curl -fsSL --proto =https --connect-timeout 15 --max-time 300 --retry 2 -o "$dl/protoc.zip" \
         "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
     got_sha=$(sha256sum "$dl/protoc.zip" | awk '{ print $1 }')
     [ "$got_sha" = "$PROTOC_SHA256" ] ||
