@@ -899,6 +899,8 @@ async fn netclasses_report_live_nets_beside_project_file_definitions() {
             "board_nets": "ipc",
             "matched_nets": "derived",
             "unmatched_patterns": "derived",
+            // The mock lists no netclasses, so what KiCad holds is unknown.
+            "kicad_unsaved": "unavailable",
         }),
         "{body}"
     );
@@ -988,6 +990,7 @@ async fn netclasses_report_unmatched_patterns_as_unavailable_without_nets() {
             "board_nets": "unavailable",
             "matched_nets": "derived",
             "unmatched_patterns": "unavailable",
+            "kicad_unsaved": "unavailable",
         }),
         "{body}"
     );

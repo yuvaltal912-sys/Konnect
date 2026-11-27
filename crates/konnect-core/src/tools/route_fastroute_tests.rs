@@ -2238,10 +2238,14 @@ fn suggested_rule(result: &Value) -> String {
         .iter()
         .filter_map(|step| step["manual"].as_str())
         .find(|text| text.contains("create_custom_drc_rule"))
-        .and_then(|text| text.split(" and rule ").nth(1))
-        .and_then(|rest| rest.split(" once apply_specctra_ses").next())
+        .and_then(|text| {
+            // Row RW: the rules come as one `rules` batch, JSON.
+            let start = text.find("rules=")? + "rules=".len();
+            let end = start + text[start..].find(": dry_run first")?;
+            let rules: Value = serde_json::from_str(&text[start..end]).ok()?;
+            rules[0]["rule"].as_str().map(str::to_string)
+        })
         .unwrap_or_else(|| panic!("no suggested rule in {result}"))
-        .to_string()
 }
 
 /// Row LT, the end to end: a 4-net bus at effort Fast. The winner passes G4, each net

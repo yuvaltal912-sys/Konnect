@@ -249,8 +249,12 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. Refuses while KiCad holds the board open, because KiCad's next \
-             save rewrites the project file from its own copy. An update changes only \
+             to exist. While KiCad (10.0.7 or later) holds the board open it works too: it changes \
+             KiCad's own copy over IPC first and reads it back, then the file, so \
+             KiCad's next save keeps the change ('written_to' says which copies). \
+             KiCad's open board applies it to its nets at its next DRC or save. \
+             'kicad.kicad_unsaved' lists settings KiCad holds that its file does not \
+             have yet. An update changes only \
              the settings you name. To see what a \
              class holds, call get_netclasses rather than this tool: naming a class \
              that does not exist here creates it with the defaults, so a call meant \
@@ -293,7 +297,11 @@ pub fn tools() -> Vec<ToolDef> {
              lists patterns naming a class that does not exist; \
              'unmatched_patterns' lists patterns whose class exists but which \
              fit no net on the board read (null when its nets are \
-             unavailable).",
+             unavailable). 'kicad_unsaved' lists the netclass settings the \
+             KiCad holding this board has in memory and its project file does \
+             not (a Board Setup edit not saved yet): routing reads the file, so \
+             save in KiCad first when it is not empty (null when no KiCad \
+             holding the board listed its classes).",
             json!({
                 "type": "object",
                 "properties": {
@@ -311,7 +319,8 @@ pub fn tools() -> Vec<ToolDef> {
              the sibling .kicad_pro. The class must already exist (create_netclass). \
              Reassigning moves the net's entry to the new class. Refuses while KiCad \
              holds the board open, because KiCad's next save rewrites the project \
-             file from its own copy.",
+             file from its own copy and KiCad 10's IPC API has no netclass-pattern \
+             command; the refusal names the steps in KiCad's Board Setup instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1635,36 +1644,50 @@ fn kicad_default_class() -> serde_json::Value {
     })
 }
 
-async fn handle_create_netclass(
+/// KiCad's key, this tool's argument name, and the value a *new* class takes
+/// when the caller says nothing. The defaults belong to creation only: folding
+/// them in before an update turned "widen HV's track" into a silent reset of
+/// the clearance, drill and via size the caller had tuned.
+const CREATE_FIELDS: [(crate::tools::netclass_live::Field, &str, f64); 4] = [
+    (
+        crate::tools::netclass_live::Field::Clearance,
+        "clearance",
+        0.2,
+    ),
+    (
+        crate::tools::netclass_live::Field::TrackWidth,
+        "trace_width",
+        0.25,
+    ),
+    (
+        crate::tools::netclass_live::Field::ViaDrill,
+        "via_drill",
+        0.4,
+    ),
+    (
+        crate::tools::netclass_live::Field::ViaDiameter,
+        "via_diameter",
+        0.8,
+    ),
+];
+
+/// What `create_netclass` did to the project file's settings.
+struct ClassEdit {
+    updated: bool,
+    changed: bool,
+    backfilled: Vec<String>,
+    stored: serde_json::Value,
+}
+
+/// Applies `create_netclass`'s arguments to the parsed project file, in place.
+fn edit_class_in_settings(
+    pro: &std::path::Path,
+    settings: &mut serde_json::Value,
+    name: &str,
     args: &serde_json::Value,
-    ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let name = match require_str(args, "name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
-        return Ok(refusal);
-    }
-    // KiCad's key, this tool's argument name, and the value a *new* class
-    // takes when the caller says nothing. The defaults belong to creation
-    // only: folding them in before an update turned "widen HV's track" into a
-    // silent reset of the clearance, drill and via size the caller had tuned.
-    const FIELDS: [(&str, &str, f64); 4] = [
-        ("clearance", "clearance", 0.2),
-        ("track_width", "trace_width", 0.25),
-        ("via_drill", "via_drill", 0.4),
-        ("via_diameter", "via_diameter", 0.8),
-    ];
+) -> anyhow::Result<ClassEdit> {
     // Only the Default must be complete. Every other class may stay sparse.
     let is_default = name == DEFAULT_CLASS_NAME;
-
-    let (pro, mut settings) = match load_project_settings(&board_path)? {
-        Ok(v) => v,
-        Err(refusal) => return Ok(refusal),
-    };
-
     let net_settings = settings
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{}: top level is not a JSON object", pro.display()))?
@@ -1687,9 +1710,9 @@ async fn handle_create_netclass(
     let mut backfilled: Vec<String> = Vec::new();
     let updated = if let Some(class) = classes.iter_mut().find(|c| c["name"] == json!(name)) {
         let before = class.clone();
-        for (key, arg, _) in FIELDS {
+        for (field, arg, _) in CREATE_FIELDS {
             if let Some(value) = opt_f64(args, arg) {
-                class[key] = json!(value);
+                class[field.key()] = json!(value);
             }
         }
         // KiCad backfills from the Default, never into it, so a Default left
@@ -1717,9 +1740,9 @@ async fn handle_create_netclass(
         // to them, so start from the full set.
         let mut class = kicad_default_class();
         class["name"] = json!(name);
-        for (key, arg, _) in FIELDS {
+        for (field, arg, _) in CREATE_FIELDS {
             if let Some(value) = opt_f64(args, arg) {
-                class[key] = json!(value);
+                class[field.key()] = json!(value);
             }
         }
         classes.push(class);
@@ -1729,8 +1752,8 @@ async fn handle_create_netclass(
         // writing the full set would sever that inheritance. -1 is what
         // KiCad's constructor gives every non-default class.
         let mut class = json!({ "name": name, "priority": -1 });
-        for (key, arg, default) in FIELDS {
-            class[key] = json!(opt_f64(args, arg).unwrap_or(default));
+        for (field, arg, default) in CREATE_FIELDS {
+            class[field.key()] = json!(opt_f64(args, arg).unwrap_or(default));
         }
         classes.push(class);
         false
@@ -1742,36 +1765,205 @@ async fn handle_create_netclass(
         .find(|c| c["name"] == json!(name))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    // Naming no value at all leaves the class exactly as it was, and so does
-    // passing the values it already holds. Saving anyway would rewrite the
-    // whole project file — the serialiser re-emits the document rather than
-    // patching it — for a call that decided nothing.
-    if changed {
-        save_project_settings(&pro, &settings)?;
-    }
+    Ok(ClassEdit {
+        updated,
+        changed,
+        backfilled,
+        stored,
+    })
+}
 
-    let note = if backfilled.is_empty() {
-        "Netclasses live in the project file; assign nets with assign_net_to_class. \
-         KiCad reads the change on next project open."
-            .to_string()
+/// The values `create_netclass` was given, checked, in nm; `Err` is the
+/// refusal for the first one KiCad cannot hold.
+fn create_netclass_values(
+    args: &serde_json::Value,
+) -> Result<Vec<(crate::tools::netclass_live::Field, i64)>, CallToolResult> {
+    let mut named = Vec::new();
+    for (field, arg, _) in CREATE_FIELDS {
+        if let Some(raw) = args.get(arg).filter(|v| !v.is_null()) {
+            let Some(mm) = raw.as_f64() else {
+                return Err(CallToolResult::error(format!(
+                    "{arg} must be a number of mm"
+                )));
+            };
+            if let Err(reason) = crate::tools::netclass_live::check_mm(arg, field, mm) {
+                return Err(CallToolResult::error(reason));
+            }
+            named.push((field, crate::tools::netclass_live::mm_to_nm(mm)));
+        }
+    }
+    Ok(named)
+}
+
+async fn handle_create_netclass(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use crate::tools::netclass_live::{self, LiveWrite};
+    let board_path = get_path(args, "board")?;
+    let name = match require_str(args, "name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        return Ok(CallToolResult::error(
+            "name must be a netclass name: not empty, no control characters",
+        ));
+    }
+    let named = match create_netclass_values(args) {
+        Ok(named) => named,
+        Err(refusal) => return Ok(refusal),
+    };
+    // The file must exist, and take the edit, before anything is sent to
+    // KiCad: a write KiCad took and the file then refused would leave the two
+    // copies apart. The edit here is a trial on a copy; nothing is saved.
+    let file_has_class = match load_project_settings(&board_path)? {
+        Err(refusal) => return Ok(refusal),
+        Ok((pro, mut trial)) => {
+            let has = trial["net_settings"]["classes"]
+                .as_array()
+                .is_some_and(|classes| classes.iter().any(|c| c["name"] == json!(name)));
+            edit_class_in_settings(&pro, &mut trial, &name, args)?;
+            has
+        }
+    };
+    let new_defaults = if name == DEFAULT_CLASS_NAME {
+        // KiCad always holds a Default, so this only names what a Default
+        // missing from KiCad would start from; it never happens on a live board.
+        Vec::new()
+    } else {
+        CREATE_FIELDS
+            .iter()
+            .map(|(field, _, default)| (*field, netclass_live::mm_to_nm(*default)))
+            .collect()
+    };
+    let schematic_locked =
+        crate::tools::verification::project_json_guard::schematic_lock_refusal(&board_path)
+            .is_some();
+    // Row RW: while KiCad holds the board, its own copy is changed first (over
+    // IPC), then the file, so KiCad's next save writes the same value again.
+    let live = match netclass_live::write_if_held(
+        ctx,
+        &board_path,
+        &name,
+        named,
+        new_defaults,
+        schematic_locked,
+        file_has_class,
+    )
+    .await?
+    {
+        LiveWrite::NotHeld => None,
+        LiveWrite::Refused(refusal) => return Ok(refusal),
+        LiveWrite::Written(written) => Some(written),
+    };
+    let is_default = name == DEFAULT_CLASS_NAME;
+
+    let (pro, edit, file_classes) = if live.is_some() {
+        match write_class_beside_kicad(&board_path, &name, args) {
+            Ok(v) => v,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "KiCad holds this board, and its copy of the project now has netclass \
+                     '{name}' as asked (read back). The project file could not be written: \
+                     {error:#}. KiCad's next save writes the change to the file; until then \
+                     routing reads the old value. Save the board in KiCad, or retry."
+                )))
+            }
+        }
+    } else {
+        let (pro, mut settings) = match load_project_settings(&board_path)? {
+            Ok(v) => v,
+            Err(refusal) => return Ok(refusal),
+        };
+        let edit = edit_class_in_settings(&pro, &mut settings, &name, args)?;
+        // Naming no value at all leaves the class exactly as it was, and so
+        // does passing the values it already holds. Saving anyway would
+        // rewrite the whole project file — the serialiser re-emits the
+        // document rather than patching it — for a call that decided nothing.
+        if edit.changed {
+            save_project_settings(&pro, &settings)?;
+        }
+        (pro, edit, Vec::new())
+    };
+
+    let note = if edit.backfilled.is_empty() || live.is_some() {
+        if live.is_some() {
+            "KiCad holds this board: its copy of the project and the project file both have \
+             the change. KiCad's open board applies it to its nets at its next DRC or save; \
+             before routing from the live board, save in KiCad or run run_drc with \
+             sync_live_board=true."
+                .to_string()
+        } else {
+            "Netclasses live in the project file; assign nets with assign_net_to_class. \
+             KiCad reads the change on next project open."
+                .to_string()
+        }
     } else {
         format!(
             "Repaired an incomplete Default netclass by adding {}. A Default missing \
              wire_width stops Eeschema placing junctions anywhere in the project; \
              reopen the project in KiCad to pick the change up. Netclasses live in the \
              project file; assign nets with assign_net_to_class.",
-            backfilled.join(", ")
+            edit.backfilled.join(", ")
         )
     };
-    Ok(CallToolResult::json(&json!({
+    let stored = &edit.stored;
+    let mut result = json!({
         "created_netclass": name,
-        "updated_existing": updated,
+        "updated_existing": edit.updated,
         "is_default": is_default,
         "clearance": stored["clearance"], "trace_width": stored["track_width"],
         "via_drill": stored["via_drill"], "via_diameter": stored["via_diameter"],
         "file": pro.display().to_string(),
         "note": note
-    })))
+    });
+    if !edit.backfilled.is_empty() {
+        result["repaired_default_fields"] = json!(edit.backfilled);
+    }
+    if let Some(written) = &live {
+        let differences = netclass_live::unsaved_differences(&written.after, &file_classes);
+        result["written_to"] = json!(["kicad", "project_file"]);
+        result["kicad"] = netclass_live::live_json(written, &differences);
+        if let Some(warning) = netclass_live::unsaved_note(&differences) {
+            result["warning"] = json!(warning);
+        }
+    } else {
+        result["written_to"] = json!(["project_file"]);
+    }
+    Ok(CallToolResult::json(&result))
+}
+
+/// The file half of a live netclass write: reads the project file, applies the
+/// same change, and writes it only if the file is still what was read (KiCad
+/// may save it at any moment). One retry on a conflict. Returns the edit and
+/// the file's classes as written, for the comparison with KiCad's copy.
+fn write_class_beside_kicad(
+    board_path: &std::path::Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<(std::path::PathBuf, ClassEdit, Vec<serde_json::Value>)> {
+    let pro = project_settings_path(board_path);
+    let mut attempt = 0;
+    loop {
+        let text = konnect_sexp::writer::read_consistent(&pro)?;
+        let mut settings: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", pro.display()))?;
+        let edit = edit_class_in_settings(&pro, &mut settings, name, args)?;
+        let classes = settings["net_settings"]["classes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !edit.changed {
+            return Ok((pro, edit, classes));
+        }
+        let content = format!("{}\n", serde_json::to_string_pretty(&settings)?);
+        match write_atomic_if_unchanged(&pro, &text, &content) {
+            Ok(()) => return Ok((pro, edit, classes)),
+            Err(konnect_sexp::SexpError::Conflict { .. }) if attempt == 0 => attempt += 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 /// KiCad's netclass patterns are wildcard expressions: `*` stands for any run
@@ -1870,12 +2062,20 @@ async fn handle_get_netclasses(
     // they are read from `.kicad_pro` either way and reported as such.
     let observation =
         board_source::read_board(ctx, &board_path, source, "net list", |client, document| {
-            client.get_nets_in(document)
+            // Row RW: KiCad's own copy of the classes, beside the file's, to
+            // name what it holds and has not saved. `None` when it cannot say.
+            let nets = client.get_nets_in(document)?;
+            Ok((
+                nets,
+                crate::tools::netclass_live::read_kicad_classes(client),
+            ))
         })
         .await?;
+    let mut kicad_classes = None;
     let (net_names, nets_source, nets_note, evidence) = match observation {
         board_source::BoardRead::Refused(refusal) => return Ok(refusal),
-        board_source::BoardRead::Live(nets) => {
+        board_source::BoardRead::Live((nets, held)) => {
+            kicad_classes = held;
             // KiCad reports the unconnected pseudo-net as an empty name. It is
             // not a net a user has, and the saved-file reader drops it too.
             let mut names: Vec<String> = nets
@@ -2049,6 +2249,18 @@ async fn handle_get_netclasses(
                  highest-priority class that sets it and falls back to Default. Lower \
                  priority numbers rank higher.",
     });
+    // What KiCad holds that its project file does not have yet: null when no
+    // KiCad holding this board listed its classes, so nothing is known.
+    let unsaved = kicad_classes
+        .as_ref()
+        .map(|held| crate::tools::netclass_live::unsaved_differences(held, &classes));
+    body["kicad_unsaved"] = json!(unsaved);
+    if let Some(warning) = unsaved
+        .as_deref()
+        .and_then(crate::tools::netclass_live::unsaved_note)
+    {
+        body["warning"] = json!(warning);
+    }
     board_source::provenance(
         &mut body,
         json!({
@@ -2061,6 +2273,11 @@ async fn handle_get_netclasses(
             // is named for what it is.
             "unmatched_patterns": if nets_readable {
                 board_source::FROM_DERIVED
+            } else {
+                board_source::FROM_UNAVAILABLE
+            },
+            "kicad_unsaved": if unsaved.is_some() {
+                board_source::FROM_IPC
             } else {
                 board_source::FROM_UNAVAILABLE
             },
@@ -2083,6 +2300,11 @@ async fn handle_assign_net_to_class(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if crate::tools::netclass_live::held_by_kicad(ctx, &board_path).await? {
+        return Ok(crate::tools::netclass_live::pattern_refusal(
+            &net_name, &netclass,
+        ));
+    }
     if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
         return Ok(refusal);
     }

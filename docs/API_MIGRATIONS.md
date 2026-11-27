@@ -50,6 +50,60 @@ removals, default changes and the supported replacement workflow.
   `ipc_outcome_unknown`): then it says to inspect the board first. On a
   plain-text result the field comes as a second text block.
 
+## Unreleased: project-rule writes while the board is open (Row RW)
+
+Additive except where named. Nothing is removed or renamed.
+
+- **`create_netclass` works while KiCad holds the board** (it refused before). It
+  sends the change to KiCad's own copy of the project over IPC (`SetNetClasses`,
+  merge), reads it back (`GetNetClasses`), then writes the same change to the
+  `.kicad_pro`, so KiCad's next save keeps it. New result fields: `written_to`
+  (`["project_file"]`, or `["kicad", "project_file"]`), `kicad` (`kicad_copy`
+  `created`/`updated`, `read_back`, `board_nets_resync: at_next_drc_or_save`,
+  `kicad_unsaved`, `board_setup_open`), `repaired_default_fields` when a Default was
+  completed, and `warning` when KiCad's copy and the file differ. It needs KiCad
+  10.0.7 or later: 10.0.1 to 10.0.6 leave a class written over IPC in a state their
+  next save reads past the end of (`netclass.cpp:223`, fixed in 10.0.7), so an older
+  KiCad is refused with the Board Setup steps. It also refuses, with nothing sent
+  and nothing written, when KiCad does not list its classes, when only one of the
+  two copies has the class (an unsaved change in KiCad), or when the schematic is
+  open in a KiCad other than the one holding the board. When KiCad took the change
+  but did not confirm it, or the file write failed after it, the refusal says what
+  KiCad's copy may hold, and the file is not written.
+  **Changed:** `clearance`, `trace_width`, `via_drill` and `via_diameter` must be
+  finite and at most 100 mm, above 0 (a clearance may be 0), and `name` must not be
+  empty or hold control characters; before, any value was written. A call that names
+  no value on a class both copies have sends nothing (`kicad_copy: unchanged`).
+- **`get_netclasses`: new `kicad_unsaved`** (and `sources.kicad_unsaved`): the
+  netclass settings the KiCad holding the board has in memory and its file does not
+  (`netclass`, `field`, `kicad_mm`, `project_file_mm`; `field: priority` with
+  `kicad` and `project_file`; or `only_in`). `null` when no KiCad holding the board
+  listed its classes. When it is not empty, a `warning` says that KiCad's next save
+  writes its copy over the file, and how to keep either copy.
+- **`assign_net_to_class` still refuses while KiCad holds the board** (KiCad 10's
+  IPC API has no netclass-pattern command); the refusal now names the steps in
+  KiCad's Board Setup.
+- **`create_custom_drc_rule` takes several rules at once.** New `rules` (1 to 64
+  items, each `{name, rule}` or `{name, constraint, minimum_mm}`) instead of
+  `name`/`rule`/`constraint`/`minimum_mm`, and `replace_existing` (with `rules`
+  only; replaces a rule of the same name in place). One preview, one
+  `plan_revision`, one apply; nothing is written unless every rule is valid. `name`
+  is no longer required at the top level (the schema's `oneOf` asks for it in the
+  single forms). New result fields: `rules` (`name`, `action`: `created`,
+  `replaced`, `edited`, `deleted`, `unchanged`) and `board_source`; the single forms
+  keep `rule`.
+- **The three custom-rule tools work while KiCad holds the board or the schematic**
+  (they refused before). KiCad never writes `.kicad_dru` when it saves and reads it
+  again at every DRC. The target DRC runs on the board KiCad holds when it answers
+  over IPC (`target_board_drc.source: scratch_copy_of_live_board`), else on the
+  saved file. With a live board the plan revision binds the rules file and the
+  project, not the board's text. New `kicad` note on a live board, `warning` when a
+  board lock exists but KiCad did not answer.
+- **`route_specctra_dsn` (fastroute): one rules step.** With length groups or pairs
+  with `max_skew_mm`, `completion.next_steps` gives one `create_custom_drc_rule`
+  call with every rule in `rules=[...]` (JSON; split into calls of at most 64 rules),
+  followed by a line for each rule that needs a note; before, one line per rule.
+
 ## Unreleased: `plan_convergent_placement` runs in the background
 
 **A behaviour change.** A call with `board` no longer waits for the plan. It answers

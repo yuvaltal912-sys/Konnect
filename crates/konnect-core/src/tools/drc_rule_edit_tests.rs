@@ -113,55 +113,255 @@ async fn served_rule_schema_and_exact_replacement_identity_refuse_without_writes
     }
 }
 
+/// Row RW: a schematic held open in KiCad no longer stops a rules write. The
+/// rules file is not the project file, and no KiCad editor writes it on save.
 #[tokio::test]
-async fn schematic_lock_before_preview_or_appearing_during_validation_prevents_rule_write() {
-    for late in [false, true] {
-        let d = tempfile::tempdir().unwrap();
-        let board = d.path().join("board.kicad_pcb");
-        std::fs::write(&board, FIXTURE).unwrap();
-        let board = board.canonicalize().unwrap();
-        let lock = konnect_sexp::writer::kicad_editor_lock_path(&board.with_extension("kicad_sch"))
-            .unwrap();
-        if !late {
-            std::fs::write(&lock, "held").unwrap();
-        }
-        let effect = if late {
-            format!("touch '{}'", lock.display())
-        } else {
-            String::new()
-        };
-        let cli = success_cli(d.path(), &effect);
-        let ctx = ToolContext::new(
-            crate::tools::ServerConfig {
-                kicad_cli: cli.to_string_lossy().into_owned(),
-                ..Default::default()
-            },
-            std::sync::Arc::new(crate::router::ToolRouter::new()),
-        );
-        let mut args = json!({"board":board,"name":"New","rule":"(rule \"New\" (constraint clearance (min 0.2mm)))"});
-        if late {
-            let proposed = crate::custom_rules::change(
-                "(version 1)\n",
-                "New",
-                args["rule"].as_str(),
-                Operation::Create,
-            )
-            .unwrap();
-            let plan = target_revision(
-                &revision(&board, None, &proposed),
-                &std::fs::read_to_string(&board).unwrap(),
-                None,
-            );
-            args["dry_run"] = json!(false);
-            args["expected_plan_revision"] = json!(plan);
-        }
+async fn a_schematic_lock_no_longer_prevents_a_rule_write() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    std::fs::write(&board, FIXTURE).unwrap();
+    let board = board.canonicalize().unwrap();
+    let lock =
+        konnect_sexp::writer::kicad_editor_lock_path(&board.with_extension("kicad_sch")).unwrap();
+    std::fs::write(&lock, "held").unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    let mut args = json!({"board":board,"name":"New","rule":"(rule \"New\" (constraint clearance (min 0.2mm)))"});
+    let preview = handle_rule_change(&args, &ctx, Operation::Create)
+        .await
+        .unwrap();
+    let plan = json_of(&preview);
+    args["dry_run"] = json!(false);
+    args["expected_plan_revision"] = plan["plan_revision"].clone();
+    let applied = handle_rule_change(&args, &ctx, Operation::Create)
+        .await
+        .unwrap();
+    assert_eq!(json_of(&applied)["status"], "applied");
+    assert!(lock.exists());
+    assert!(std::fs::read_to_string(board.with_extension("kicad_dru"))
+        .unwrap()
+        .contains("(rule \"New\""));
+}
+
+fn ctx_with(cli: &Path) -> ToolContext {
+    ToolContext::new(
+        crate::tools::ServerConfig {
+            kicad_cli: cli.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        std::sync::Arc::new(crate::router::ToolRouter::new()),
+    )
+}
+
+fn json_of(result: &CallToolResult) -> Value {
+    assert!(!result.is_error, "{result:?}");
+    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+        panic!("text content")
+    };
+    serde_json::from_str(text).unwrap()
+}
+
+const SKEW_A: &str = "(rule \"len_a\" (condition \"A.NetName == 'D+' || A.NetName == 'D-'\") (constraint skew (max 0.1mm)))";
+const LEN_B: &str =
+    "(rule \"len_b\" (condition \"A.NetName == 'CLK'\") (constraint length (min 10mm) (max 12mm)))";
+
+fn batch_args(board: &Path) -> Value {
+    json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A},{"name":"len_b","rule":LEN_B},{"name":"min_w","constraint":"track_width","minimum_mm":0.2}]})
+}
+
+/// Several rules, one preview, one plan revision, one apply: every rule lands,
+/// in order, and the rules already in the file are kept byte for byte.
+#[tokio::test]
+async fn a_batch_previews_once_and_applies_once_under_one_revision() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    let path = board.with_extension("kicad_dru");
+    std::fs::write(&board, FIXTURE).unwrap();
+    let prefix = "# kept\n(version 1)\n(rule \"Other\" (constraint track_width (min 0.2mm)))\n";
+    std::fs::write(&path, prefix).unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    let mut args = batch_args(&board);
+
+    let preview = json_of(
+        &handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(preview["status"], "ready");
+    assert_eq!(
+        preview["rules"],
+        json!([{"name":"len_a","action":"created"},{"name":"len_b","action":"created"},{"name":"min_w","action":"created"}])
+    );
+    assert!(preview.get("rule").is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), prefix);
+
+    args["dry_run"] = json!(false);
+    args["expected_plan_revision"] = preview["plan_revision"].clone();
+    let applied = json_of(
+        &handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(applied["status"], "applied");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.starts_with(prefix.trim_end()), "{written}");
+    let a = written.find(SKEW_A).unwrap();
+    let b = written.find(LEN_B).unwrap();
+    let w = written.find("(rule \"min_w\"").unwrap();
+    assert!(a < b && b < w, "{written}");
+}
+
+/// The batch's one revision binds every rule in it: a revision from a preview
+/// of a different set (here, the first rule alone) does not apply it.
+#[tokio::test]
+async fn a_revision_from_another_set_of_rules_does_not_apply_the_batch() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    std::fs::write(&board, FIXTURE).unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    let single = json_of(
+        &handle_rule_change(
+            &json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A}]}),
+            &ctx,
+            Operation::Create,
+        )
+        .await
+        .unwrap(),
+    );
+    let mut args = batch_args(&board);
+    args["dry_run"] = json!(false);
+    args["expected_plan_revision"] = single["plan_revision"].clone();
+    let refused = handle_rule_change(&args, &ctx, Operation::Create)
+        .await
+        .unwrap();
+    assert!(refused.is_error);
+    assert!(!board.with_extension("kicad_dru").exists());
+}
+
+/// A stale revision: the rules file changed after the preview.
+#[tokio::test]
+async fn a_batch_refuses_a_stale_revision_and_keeps_the_file() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    let path = board.with_extension("kicad_dru");
+    std::fs::write(&board, FIXTURE).unwrap();
+    std::fs::write(&path, "(version 1)\n").unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    let mut args = batch_args(&board);
+    let preview = json_of(
+        &handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap(),
+    );
+    let edited = "(version 1)\n(rule \"Hand\" (constraint clearance (min 0.3mm)))\n";
+    std::fs::write(&path, edited).unwrap();
+    args["dry_run"] = json!(false);
+    args["expected_plan_revision"] = preview["plan_revision"].clone();
+    let refused = handle_rule_change(&args, &ctx, Operation::Create)
+        .await
+        .unwrap();
+    assert!(refused.is_error);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+}
+
+/// All or nothing: one bad rule in the batch, a name twice, a name the file
+/// already has, or a mixed call, and nothing is written.
+#[tokio::test]
+async fn a_batch_with_any_bad_rule_writes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    let path = board.with_extension("kicad_dru");
+    std::fs::write(&board, FIXTURE).unwrap();
+    let existing = "(version 1)\n(rule \"len_b\" (constraint clearance (min 0.3mm)))\n";
+    std::fs::write(&path, existing).unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    for args in [
+        json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A},{"name":"bad","rule":"(rule \"other\" (constraint clearance (min 0.2mm)))"}]}),
+        json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A},{"name":"len_a","rule":SKEW_A}]}),
+        json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A},{"name":"len_a","rule":SKEW_A}],"replace_existing":true}),
+        json!({"board":board,"rules":[{"name":"len_b","rule":LEN_B}]}),
+        json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A}],"name":"len_a"}),
+        json!({"board":board,"rules":[{"name":"len_a","rule":SKEW_A,"extra":1}]}),
+        json!({"board":board,"rules":[]}),
+        json!({"board":board,"name":"x","rule":"(rule \"x\" (constraint clearance (min 0.2mm)))","replace_existing":true}),
+    ] {
         let result = handle_rule_change(&args, &ctx, Operation::Create)
             .await
             .unwrap();
-        assert!(result.is_error, "{result:?}");
-        assert!(lock.exists());
-        assert!(!board.with_extension("kicad_dru").exists());
+        assert!(result.is_error, "{args}: {result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing, "{args}");
     }
+}
+
+/// `replace_existing` replaces a rule of the same name in place, keeping the
+/// rules around it; a second identical call is a no-op.
+#[tokio::test]
+async fn replace_existing_replaces_in_place_and_repeats_as_a_noop() {
+    let d = tempfile::tempdir().unwrap();
+    let board = d.path().join("board.kicad_pcb");
+    let path = board.with_extension("kicad_dru");
+    std::fs::write(&board, FIXTURE).unwrap();
+    let before = "(version 1)\n(rule \"len_b\" (constraint clearance (min 0.3mm)))\n(rule \"After\" (constraint clearance (min 0.4mm)))\n";
+    std::fs::write(&path, before).unwrap();
+    let ctx = ctx_with(&success_cli(d.path(), ""));
+    let mut args =
+        json!({"board":board,"rules":[{"name":"len_b","rule":LEN_B}],"replace_existing":true});
+    let preview = json_of(
+        &handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        preview["rules"],
+        json!([{"name":"len_b","action":"replaced"}])
+    );
+    args["dry_run"] = json!(false);
+    args["expected_plan_revision"] = preview["plan_revision"].clone();
+    json_of(
+        &handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap(),
+    );
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        written,
+        before.replace("(rule \"len_b\" (constraint clearance (min 0.3mm)))", LEN_B)
+    );
+    let again = json_of(
+        &handle_rule_change(
+            &json!({"board":board,"rules":[{"name":"len_b","rule":LEN_B}],"replace_existing":true}),
+            &ctx,
+            Operation::Create,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(again["status"], "noop");
+    assert_eq!(
+        again["rules"],
+        json!([{"name":"len_b","action":"unchanged"}])
+    );
+}
+
+#[test]
+fn the_published_schema_takes_the_batch_form_alone() {
+    let tool = tools()
+        .into_iter()
+        .find(|t| t.name == "create_custom_drc_rule")
+        .unwrap();
+    let batch = json!({"board":"b.kicad_pcb","rules":[{"name":"a","rule":"(rule \"a\" (constraint clearance (min 0.2mm)))"},{"name":"b","constraint":"clearance","minimum_mm":0.2}],"replace_existing":true});
+    assert!(tool.input_validator.is_valid(&batch));
+    let mut with_name = batch.clone();
+    with_name["name"] = json!("a");
+    assert!(!tool.input_validator.is_valid(&with_name));
+    assert!(!tool.input_validator.is_valid(
+        &json!({"board":"b.kicad_pcb","name":"X","rule":"(rule \"X\" (constraint clearance (min 0.2mm)))","replace_existing":true})
+    ));
+    assert!(!tool
+        .input_validator
+        .is_valid(&json!({"board":"b.kicad_pcb","rules":[{"name":"a","constraint":"clearance"}]})));
+    assert!(!tool
+        .input_validator
+        .is_valid(&json!({"board":"b.kicad_pcb","rules":[]})));
 }
 
 #[tokio::test]
@@ -235,4 +435,39 @@ async fn direct_mixed_rule_forms_refuse_even_without_schema_dispatch() {
         .unwrap();
     assert!(result.is_error, "{result:?}");
     assert!(!board.with_extension("kicad_dru").exists());
+}
+
+/// The saved board is bound by the revision when KiCad does not hold it, so a
+/// board or project saved while KiCad checks the candidate refuses the apply.
+#[tokio::test]
+async fn a_saved_board_or_project_changed_during_validation_refuses_the_apply() {
+    for changed in ["kicad_pcb", "kicad_pro"] {
+        let d = tempfile::tempdir().unwrap();
+        let board = d.path().join("board.kicad_pcb");
+        std::fs::write(&board, FIXTURE).unwrap();
+        std::fs::write(board.with_extension("kicad_pro"), "{}\n").unwrap();
+        let board = board.canonicalize().unwrap();
+        let preview_ctx = ctx_with(&success_cli(d.path(), ""));
+        let mut args = batch_args(&board);
+        let preview = json_of(
+            &handle_rule_change(&args, &preview_ctx, Operation::Create)
+                .await
+                .unwrap(),
+        );
+        // The check itself rewrites the file, as a save in KiCad would.
+        let target = board.with_extension(changed);
+        let effect = if changed == "kicad_pcb" {
+            format!("printf '\\n' >> '{}'", target.display())
+        } else {
+            format!("printf '%s' '{{\"saved\":true}}' > '{}'", target.display())
+        };
+        let ctx = ctx_with(&success_cli(d.path(), &effect));
+        args["dry_run"] = json!(false);
+        args["expected_plan_revision"] = preview["plan_revision"].clone();
+        let result = handle_rule_change(&args, &ctx, Operation::Create)
+            .await
+            .unwrap();
+        assert!(result.is_error, "{changed}: {result:?}");
+        assert!(!board.with_extension("kicad_dru").exists(), "{changed}");
+    }
 }
