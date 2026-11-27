@@ -78,7 +78,8 @@ for a in "\$@"; do
         +* | -*) ;;
         mutants) [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
                  unset CARGO_TARGET_DIR
-                 mkdir -p $(printf %q "$MUT_TMP") && export TMPDIR=$(printf %q "$MUT_TMP")
+                 mkdir -p $(printf %q "$MUT_TMP") || { echo "hpc: cannot make $(printf %q "$MUT_TMP"); not running cargo mutants on the node's /tmp" >&2; exit 3; }
+                 export TMPDIR=$(printf %q "$MUT_TMP")
                  echo "hpc: cargo mutants copies its trees under \$TMPDIR, not the node's /tmp" >&2
                  break ;;
         *) break ;;
@@ -91,13 +92,18 @@ if [ -n "$real_mutants" ]; then
 #!/bin/bash
 [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
 unset CARGO_TARGET_DIR
-mkdir -p $(printf %q "$MUT_TMP") && export TMPDIR=$(printf %q "$MUT_TMP")
+mkdir -p $(printf %q "$MUT_TMP") || { echo "hpc: cannot make $(printf %q "$MUT_TMP"); not running cargo mutants on the node's /tmp" >&2; exit 3; }
+export TMPDIR=$(printf %q "$MUT_TMP")
 echo "hpc: cargo mutants copies its trees under \$TMPDIR, not the node's /tmp" >&2
 exec $(printf %q "$real_mutants") "\$@"
 EOF
 fi
 chmod +x "$SHIM"/*
 export PATH="$SHIM:$PATH"
+# A clean cargo-mutants removes its copies; a killed one does not. Remove them when the job ends
+# (prepare.sh also removes any an earlier killed run left).
+trap 'rm -rf "$MUT_TMP"' EXIT
+trap 'exit 143' TERM
 
 # Sum the libtest summaries ("test result: ok. 12 passed; 0 failed; 3 ignored; ...").
 counts() {

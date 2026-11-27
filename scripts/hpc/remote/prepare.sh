@@ -68,6 +68,11 @@ mkdir "$LOCK" || { echo "prepare: lost the race for the run lock" >&2; exit 3; }
 echo "$RUNID" >"$LOCK/owner"
 echo "$$ $(hostname)" >"$LOCK/pid"
 heartbeat() { touch "$LOCK/owner"; }
+# cargo-mutants' copies of an earlier run that was killed (scancel, time limit, OOM) skipped its
+# own cleanup; with the lock held, no other run is using them.
+for left in "$ROOT"/runs/*/scratch/mutants-tmp; do
+    [ -d "$left" ] && { log "removed leftover mutants copies $left"; rm -rf "$left"; }
+done
 
 # 3. The exact commit, in a fixed checkout path so the cargo cache stays valid.
 [ -d "$ROOT/repo.git" ] || git init -q --bare "$ROOT/repo.git"

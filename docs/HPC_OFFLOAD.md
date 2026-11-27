@@ -265,7 +265,9 @@ several GB for `konnect-core`) goes under `TMPDIR`. On the node that was `/tmp`,
 `No space left on device` (job 20938, 40 CPUs). The same two wrappers now set `TMPDIR` for a
 mutants process to `scratch/mutants-tmp` in the run's folder on the network home, and the step's
 log says `hpc: cargo mutants copies its trees under <folder>, not the node's /tmp`. Other cargo
-commands keep the node's `/tmp`. cargo-mutants removes its copies when it ends.
+commands keep the node's `/tmp`. If the folder cannot be made, the step stops rather than fall back
+to `/tmp`. cargo-mutants removes its copies when it ends cleanly. `run-plan.sh` removes the folder
+when the job ends, and `prepare.sh` removes any that a killed run left before the next job.
 
 Two more lessons from the same day:
 - **Filter the tests.** Without a filter after `--`, the unmutated baseline runs the whole lib

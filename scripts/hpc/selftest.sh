@@ -173,10 +173,11 @@ pass s-value       cargo --manifest-path mutants test 2>/dev/null | grep -qx "fa
 pass s-no-note     cargo test 2>&1 >/dev/null | wc -c | grep -qx " *0"
 pass m-tmp         cargo mutants --jobs 2 2>/dev/null | grep -q "^fake tmp=.*/scratch/mutants-tmp$"
 pass m-tmp-direct  cargo-mutants mutants 2>/dev/null | grep -q "^fake tmp=.*/scratch/mutants-tmp$"
-pass s-tmp         cargo test -p x 2>/dev/null | grep "^fake tmp=" | grep -vq "mutants-tmp"
+pass s-tmp         cargo test -p x 2>/dev/null | grep -qx "fake tmp=$TMPDIR"
+pass s-tmp-filter  cargo test mutants 2>/dev/null | grep -qx "fake tmp=$TMPDIR"
 EOF
 check "mutants target plan" 0 "submitted" "$sub" "$F/plan/target.plan"
-check "mutants: own targets, other steps shared" 0 "ALL STEPS AS EXPECTED (15 steps)" "$fetch"
+check "mutants: own targets, other steps shared" 0 "ALL STEPS AS EXPECTED (16 steps)" "$fetch"
 
 printf 'pass a true\nfail:ctl/break.patch c echo other\n' >"$F/plan/nobase.plan"
 check "control without baseline refused" 1 "has no baseline" "$sub" "$F/plan/nobase.plan" --dry-run
