@@ -286,7 +286,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 
 ## Row AP2, background placement runs (2026-11-27)
 
-**Why.** On one of the owner's runs, `plan_convergent_placement` at effort h took 2,155 s. The MCP client gave up at 1,801 s. The server finished, but the result never reached the agent, which rebuilt the winner by hand from `table.md` and `search.json`, without `apply_with`. Fix D of the six ranked after that run (see "Row HS").
+**Why.** On one of the owner's boards, a `plan_convergent_placement` run at effort h outlasted the MCP client's 1,801 s timeout. The server finished, but the result never reached the agent, which rebuilt the winner by hand from `table.md` and `search.json`, without `apply_with`. Fix D of the six ranked after that run (see "Row HS").
 
 **What changed** (`docs/API_MIGRATIONS.md` has the fields):
 - A call with `board` reads the live board, claims it, makes the run folder and answers at once: `status: started` and a `run_id`.
@@ -321,7 +321,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 
 ## Row HS, the honest summaries (merged as #124, 2026-11-27)
 
-**Why.** A run on one of the owner's boards (2026-11-25) showed results that read as complete where parts were never checked. The routing status was `complete` with no length group defined. The search tried the pours both ways and nothing said which way won. The placement plan moved two parts by 0.25 mm and was presented as a plan. The owner chose this row first ("Yes, start A", 2026-11-27) from a ranked list of six fixes. The other five: board safety (live-board warning, automatic checkpoints, a clear "board not open" error), `delete_all_routing` with a preview, asynchronous placement runs (Row AP2), netclass writes over IPC or a `width` argument, and one place + pours + route mode. B, C, D (Row AP2) and E started in parallel sessions on 2026-11-27; F comes last.
+**Why.** A run on one of the owner's boards (2026-11-25) showed results that read as complete where parts were never checked. The routing status was `complete` with no length group defined. The search tried the pours both ways and nothing said which way won. The placement plan moved two parts by less than the 0.5 mm small-change bound and was presented as a plan. The owner chose this row first ("Yes, start A", 2026-11-27) from a ranked list of six fixes. The other five: board safety (live-board warning, automatic checkpoints, a clear "board not open" error), `delete_all_routing` with a preview, asynchronous placement runs (Row AP2), netclass writes over IPC or a `width` argument, and one place + pours + route mode. B, C, D (Row AP2) and E started in parallel sessions on 2026-11-27; F comes last.
 
 **What changed** (additive only; `docs/API_MIGRATIONS.md` has the fields):
 - `route_specctra_dsn` (fastroute) has a top-level `summary`, in the result with a winner and in the one without. `summary.lengths` says whether the judge checked lengths. When it did not, it lists nets whose names read as pairs. `summary.pours` gives the run counts per shape, the winner's shape, and pours left out at the export. `completion.not_checked` is `["lengths"]` when nothing was checked. `length_matching` is still absent without a group (L15).

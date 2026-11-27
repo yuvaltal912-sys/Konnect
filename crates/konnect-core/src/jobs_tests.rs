@@ -311,7 +311,8 @@ async fn a_running_record_with_a_free_lock_is_interrupted_and_a_held_one_is_runn
         panic!("{report:?}");
     };
     assert!(!here);
-    assert!(elapsed_s >= 5.0, "{elapsed_s}");
+    // Seconds since the record's start, not milliseconds: it started 5 s ago.
+    assert!((5.0..60.0).contains(&elapsed_s), "{elapsed_s}");
     drop(lock);
     let report = jobs.report(&run.state, &KIND, FIRST, Duration::ZERO).await;
     assert!(matches!(report, Report::Interrupted { .. }), "{report:?}");
@@ -430,10 +431,16 @@ async fn a_running_record_beside_its_result_is_done() {
     let report = Jobs::default()
         .report(&run.state, &KIND, FIRST, Duration::ZERO)
         .await;
-    let Report::Done { result, .. } = report else {
+    let Report::Done { record, result } = report else {
         panic!("{report:?}");
     };
+    assert_eq!(record.state, RunState::Done);
     assert_eq!(result, json!({ "status": "planned" }));
+}
+
+#[test]
+fn the_server_has_one_registry() {
+    assert!(std::ptr::eq(Jobs::global(), Jobs::global()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

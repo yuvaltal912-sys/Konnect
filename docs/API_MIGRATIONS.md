@@ -8,8 +8,8 @@ removals, default changes and the supported replacement workflow.
 **A behaviour change.** A call with `board` no longer waits for the plan. It answers
 at once with `status: started`, a `run_id`, `board`, `effort`, `planned_from`,
 `records` (the run folder) and `next_steps`. Before, a run at effort h could outlast
-the MCP client's time limit (one took 2,155 s; the client gave up at 1,800 s), and
-its result was lost.
+the MCP client's time limit (the client gives up after about 1,800 s), and its
+result was lost.
 
 - **New arguments:** `run_id` (report a run) and `wait_s` (with `run_id` only: wait
   up to 0 to 600 s for the run to end; default 0). `board` is no longer required: a
