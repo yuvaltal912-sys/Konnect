@@ -1935,6 +1935,39 @@ impl KiCadIpcClient {
         Ok(response.contents)
     }
 
+    /// The project's netclasses as KiCad holds them in memory (`GetNetClasses`,
+    /// served by KiCad's common handler for the project it has loaded,
+    /// `api_handler_common.cpp:100`). This is KiCad's own copy: its next board
+    /// save writes it to `.kicad_pro` (`files.cpp:1049`), and until then it can
+    /// differ from the saved file.
+    pub fn get_net_classes(&self) -> Result<Vec<kiapi::common::project::NetClass>> {
+        let response = unpack_required::<kiapi::common::commands::NetClassesResponse>(
+            self.send_command(
+                &kiapi::common::commands::GetNetClasses {},
+                "kiapi.common.commands.GetNetClasses",
+            )?,
+            "GetNetClasses",
+        )?;
+        Ok(response.net_classes)
+    }
+
+    /// Merge `classes` into KiCad's in-memory netclasses (`SetNetClasses` with
+    /// `MMM_MERGE`, `api_handler_common.cpp:123`): a class of the same name is
+    /// updated in place, field by field, and a new name is added; every other
+    /// class is left alone. Up to 10.0.6 KiCad answers `Empty` whether or not
+    /// it applied a class (a class sent as `NCT_IMPLICIT` is skipped without a
+    /// word, `netclass.cpp:220`); 10.0.7 refuses such a class with
+    /// `AS_BAD_REQUEST`. Either way a caller reads back with
+    /// [`Self::get_net_classes`].
+    pub fn merge_net_classes(&self, classes: Vec<kiapi::common::project::NetClass>) -> Result<()> {
+        let command = kiapi::common::commands::SetNetClasses {
+            net_classes: classes,
+            merge_mode: kiapi::common::types::MapMergeMode::MmmMerge as i32,
+        };
+        self.send_command(&command, "kiapi.common.commands.SetNetClasses")?;
+        Ok(())
+    }
+
     /// Get all nets on the board.
     pub fn get_nets(&self) -> Result<Vec<IpcNet>> {
         self.get_nets_in(self.get_board_document()?)
