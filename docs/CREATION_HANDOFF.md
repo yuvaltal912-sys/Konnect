@@ -307,7 +307,14 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - **`apply_specctra_ses`'s steps already include `create_checkpoint`** (`integration.rs`, the plane steps). Those steps stay as they are, and the automatic checkpoint reuses the one they make.
 - **Left out on purpose** (two review nits): no fast path that skips hashing the project, because it is read once per bulk call and is megabytes; and the pre-flight runs before the route's argument checks, so with KiCad down a bad argument is reported second.
 
-**Verified:** see the gate and control records below (filled in after the final gate).
+**Verified** (records in the main checkout's `target/creation-research/board-safety/`, git-ignored):
+- **Baseline gate** on `c49ee383`: fmt; workspace tests 5,945 passed, 0 failed, 187 ignored; sandboxed fastroute 75; doctests 9; `simulation_live` 95; clippy; deny; `fix-doc-counts` no change; release build; installed Konnect hash unchanged.
+- **Tests:** 30 in `board_safety_tests.rs`, all passing.
+- **Negative controls:** 27, one break per guard (seam wording, write gate, KiCad-down read, the route pre-flight and its opt-out and schema, the four held states, reuse and read-back of a checkpoint, no checkpoint or no project means no edit, the outcome rule, the plain-text note, the registry wrap). All 27 caught; sources restored. Two breaks were first rewritten because the compiler refused them (a non-exhaustive match).
+- **Mutants** (`cargo mutants`, `board_safety.rs` plus `ensure_checkpoint`, tests `tools::board_safety_tests::`): 37 mutants, 20 caught, 8 unviable, 9 missed. Four misses were real test gaps (the test built the sentence it checked with the function under test; nobody read the checkpoint's label); fixed, and those four are now caught. The other five sit in `ensure_checkpoint`'s one retry when the files change between scan and copy, which no test can reach without a hook into the copy; not covered. `cargo llvm-cov` not run: the controls and mutants already map each guard to a test.
+- **Review:** two rounds by an agent that did not write the code (Sonnet 5.5, effort high). Round 1: 1 must-fix (Undo offered after an error), 5 should-fix, nits. Round 2: 0 must-fix, 5 should-fix, nits. All fixed except the two nits named above.
+- **Merged in:** `fork/main` `8d03f0bb` (#125, #126, #127), docs conflicts only; every PR's rows kept.
+- **Final gate:** below, after the run.
 
 **Not verified.** No run against a live KiCad: the IPC answers are mock doubles. No Windows or Linux.
 

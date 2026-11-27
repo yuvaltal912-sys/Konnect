@@ -39,18 +39,30 @@ fn message_of(result: &CallToolResult) -> String {
 /// Whether `message` carries the plain sentence for `board`, at its start
 /// (capitalised) or inside it.
 fn says_not_open(message: &str, board: &Path) -> bool {
-    message
-        .to_lowercase()
-        .contains(&not_open_sentence(board).to_lowercase())
+    // Spelled out here, not built by `not_open_sentence`, so a broken sentence fails.
+    let sentence = format!(
+        "the board is not open in kicad's pcb editor: open {} and call again",
+        board.display()
+    )
+    .to_lowercase();
+    assert_eq!(not_open_sentence(board).to_lowercase(), sentence);
+    message.to_lowercase().contains(&sentence)
 }
 
 /// Whether `message` carries the KiCad-down sentence for `board`, and does not
 /// claim the board is closed.
 fn says_unreachable(message: &str, board: &Path) -> bool {
-    message
-        .to_lowercase()
-        .contains(&board_safety::unreachable_sentence(board).to_lowercase())
-        && !says_not_open(message, board)
+    let sentence = format!(
+        "kicad cannot be reached, so konnect cannot see {} open in its pcb editor: start kicad, \
+         open the board there and call again",
+        board.display()
+    )
+    .to_lowercase();
+    assert_eq!(
+        board_safety::unreachable_sentence(board).to_lowercase(),
+        sentence
+    );
+    message.to_lowercase().contains(&sentence) && !says_not_open(message, board)
 }
 
 fn body_of(result: &CallToolResult) -> Value {
@@ -489,6 +501,19 @@ async fn a_bulk_edit_checkpoints_first_and_reuses_it_until_the_files_change() {
         .unwrap()
         .to_string();
     assert_eq!(checkpoint_ids(dir.path()), vec![id.clone()]);
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            dir.path()
+                .join(format!(".konnect/checkpoints/{id}/manifest.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["label"], "automatic: before set_component_placements",
+        "{manifest}"
+    );
+    assert_eq!(manifest["reason"], "automatic", "{manifest}");
     assert_eq!(note["restore"]["tool"], "restore_checkpoint");
     assert_eq!(note["restore"]["arguments"]["checkpoint_id"], id.as_str());
     assert_eq!(
