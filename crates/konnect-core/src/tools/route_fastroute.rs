@@ -2100,6 +2100,7 @@ pub(crate) fn result_json(
         {
             result[key] = value;
         }
+        result["summary"] = summary_json(dsn, shapes, outcome, pairs, lengths, None);
         return result;
     };
     // The planes the winning variant gave the router, with their layers, from
@@ -2268,6 +2269,19 @@ pub(crate) fn result_json(
             steps.push(json!({ "step": number, "manual": line }));
         }
     }
+    // What the call checked and how it gave the pours, in plain lines; a check
+    // that did not run is named in `completion.not_checked`.
+    result["summary"] = summary_json(
+        dsn,
+        shapes,
+        outcome,
+        pairs,
+        lengths,
+        Some(judged.gates.g4.is_empty()),
+    );
+    if !lengths.checked() {
+        result["completion"]["not_checked"] = json!(["lengths"]);
+    }
     if let Some(error) = width_error {
         result["width_report_error"] = json!(error);
     }
@@ -2276,6 +2290,137 @@ pub(crate) fn result_json(
         result["width_unmeasured_total"] = json!(widths.unmeasured_total);
     }
     result
+}
+
+/// The result's `summary`: one plain line each on lengths
+/// ([`LengthPlan::summary_json`]) and pours ([`pours_summary`]), so that a reader
+/// sees what `status` covers and what it does not. `g4_pass` is the winner's G4
+/// verdict, `None` without a judged winner.
+pub(crate) fn summary_json(
+    dsn: &Path,
+    shapes: &[Shape],
+    outcome: &crate::route_search::SearchOutcome,
+    pairs: &route_pairs::PairsPlan,
+    lengths: &LengthPlan,
+    g4_pass: Option<bool>,
+) -> Value {
+    let likely = if lengths.checked() {
+        Vec::new()
+    } else {
+        board_likely_pairs(dsn, pairs)
+    };
+    json!({
+        "lengths": lengths.summary_json(g4_pass, &likely),
+        "pours": pours_summary(shapes, outcome),
+    })
+}
+
+/// [`route_lengths::likely_pairs`] of the board the DSN was exported from (its
+/// manifest's `board_path`), leaving out the nets of the intent's pairs; empty when
+/// the board cannot be found or read.
+fn board_likely_pairs(
+    dsn: &Path,
+    pairs: &route_pairs::PairsPlan,
+) -> Vec<route_lengths::LikelyPair> {
+    let Some(board) = crate::specctra::manifest_beside(dsn)
+        .and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from))
+    else {
+        return Vec::new();
+    };
+    let Ok(nets) = std::fs::read_to_string(&board)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| route_lengths::board_net_names(&text))
+    else {
+        return Vec::new();
+    };
+    let declared: std::collections::BTreeSet<String> = pairs
+        .resolved
+        .iter()
+        .flat_map(|pair| [pair.positive.clone(), pair.negative.clone()])
+        .chain(
+            pairs
+                .unresolved
+                .iter()
+                .flat_map(|pair| [pair.positive.clone(), pair.negative.clone()]),
+        )
+        .collect();
+    route_lengths::likely_pairs(&nets, &declared)
+}
+
+/// The result's `summary.pours`: how the search gave the board's pours to the
+/// router, run counts by shape, the winner's shape, and one line.
+/// - One shape (`as_exported`): the DSN has no plane, so no pour was tried.
+/// - Two shapes: both ways were tried; per shape the runs launched, judged and
+///   passing every gate, and the winner's way.
+pub(crate) fn pours_summary(
+    shapes: &[Shape],
+    outcome: &crate::route_search::SearchOutcome,
+) -> Value {
+    let winner = outcome
+        .winner
+        .and_then(|position| outcome.runs.get(position))
+        .map(|record| record.shape);
+    let rows: Vec<(Shape, usize, usize, usize)> = shapes
+        .iter()
+        .map(|shape| {
+            let runs: Vec<&RunRecord> = outcome
+                .runs
+                .iter()
+                .filter(|record| record.shape == *shape)
+                .collect();
+            let judged: Vec<&&RunRecord> = runs
+                .iter()
+                .filter(|record| record.outcome == "judged")
+                .collect();
+            let passed = judged
+                .iter()
+                .filter(|record| record.judged.as_ref().is_some_and(|j| j.gates.all_pass()))
+                .count();
+            (*shape, runs.len(), judged.len(), passed)
+        })
+        .collect();
+    let tried = shapes.contains(&Shape::Omitted);
+    let line = if !tried {
+        "Pours: none given to the router. The DSN has no plane, so every run routed without a pour. If the board should have pours (plan_pours proposes them), add them with add_zone and refill_zones before export_specctra_dsn, then route again.".to_string()
+    } else {
+        let part = |shape: Shape, words: &str| {
+            rows.iter()
+                .find(|row| row.0 == shape)
+                .map(|(_, launched, judged, passed)| {
+                    format!(
+                        "{words}: {launched} run(s), {judged} judged, {passed} passed every gate"
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let won = match winner {
+            Some(Shape::AsExported) => " The winner gave the router the pours as planes.",
+            Some(Shape::Omitted) => " The winner routed with the pours left out: the router never saw them, and KiCad fills them after apply_specctra_ses.",
+            None => " No run won.",
+        };
+        format!(
+            "Pours: tried two ways. {}. {}.{won}",
+            part(Shape::AsExported, "As planes (the DSN as exported)"),
+            part(
+                Shape::Omitted,
+                "Left out (planes removed, refilled after import)"
+            ),
+        )
+    };
+    json!({
+        "tried": tried,
+        "shapes": rows
+            .iter()
+            .map(|(shape, launched, judged, passed)| json!({
+                "shape": shape,
+                "launched": launched,
+                "judged": judged,
+                "all_gates_pass": passed,
+            }))
+            .collect::<Vec<_>>(),
+        "winner_shape": winner,
+        "line": line,
+    })
 }
 
 #[cfg(test)]

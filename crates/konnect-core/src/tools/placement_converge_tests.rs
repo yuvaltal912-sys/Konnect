@@ -269,6 +269,15 @@ async fn a_plan_routes_only_family_c_and_returns_the_rank_one_winner_as_apply_ar
     assert!(!placements.is_empty());
     assert_eq!(body["winner"]["moved_parts"], placements.len());
     let (model, _) = search_model(&plan).unwrap();
+    // What moved, against the board as read: the same count and verdict the
+    // response gives.
+    let moves = moves_of(&model, &placements);
+    assert_eq!(body["winner"]["moves_total"], moves.len());
+    assert_eq!(body["winner"]["change"], change_of(&moves).name());
+    assert_eq!(
+        body["winner"]["moves"].as_array().unwrap().len(),
+        moves.len().min(MAX_LINES)
+    );
     let applied = placements_applied_to(&model.text, &placements).unwrap();
     let file: Value =
         serde_json::from_str(&std::fs::read_to_string(plan.folder.join("search.json")).unwrap())
@@ -633,4 +642,93 @@ fn the_whole_plan_on_the_public_placement_fixture() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+// ─── What the winner changes (the honest summary) ────────────────────────────
+
+/// The demo model's part `reference` at its own position, moved by `dx` and turned by
+/// `turn` degrees.
+fn nudged(model: &BoardModel, reference: &str, dx: f64, turn: f64) -> IpcFootprintPlacement {
+    let part = model
+        .parts
+        .iter()
+        .find(|part| part.reference.as_deref() == Some(reference))
+        .unwrap();
+    IpcFootprintPlacement {
+        reference: reference.to_string(),
+        x: part.at.0 + dx,
+        y: part.at.1,
+        rotation: part.rotation_deg + turn,
+    }
+}
+
+#[test]
+fn the_moves_list_only_parts_that_move_or_turn_largest_first() {
+    let model =
+        crate::place_generators::tests::model_of(&crate::place_generators::tests::demo_text(), &[]);
+    let placements = vec![
+        nudged(&model, "U1", 0.0, 0.0),
+        nudged(&model, "R1", 0.25, 0.0),
+        nudged(&model, "R2", -2.0, 0.0),
+        nudged(&model, "R3", 0.0, 90.0),
+        // A full turn is no turn.
+        nudged(&model, "R4", 0.0, 360.0),
+    ];
+    let moves = moves_of(&model, &placements);
+    let names: Vec<&str> = moves.iter().map(|m| m.reference.as_str()).collect();
+    assert_eq!(names, ["R2", "R1", "R3"], "{moves:?}");
+    assert!((moves[0].distance_mm - 2.0).abs() < 1e-9);
+    assert!((moves[0].dx_mm + 2.0).abs() < 1e-9);
+    assert_eq!(moves[2].rotation_deg, 90.0);
+    assert_eq!(moves[2].distance_mm, 0.0);
+    assert_eq!(change_of(&moves), Change::Placement);
+}
+
+#[test]
+fn a_plan_of_nudges_is_a_small_change_and_says_so_first() {
+    let model =
+        crate::place_generators::tests::model_of(&crate::place_generators::tests::demo_text(), &[]);
+    // Two parts by 0.25 mm: the run the owner reported.
+    let small = moves_of(
+        &model,
+        &[
+            nudged(&model, "R1", 0.25, 0.0),
+            nudged(&model, "R2", -0.25, 0.0),
+        ],
+    );
+    assert_eq!(change_of(&small), Change::Small);
+    // At the bound it is still small; just past it, or with a turn, it is not.
+    let at_bound = moves_of(&model, &[nudged(&model, "R1", SMALL_MOVE_MM, 0.0)]);
+    assert_eq!(change_of(&at_bound), Change::Small);
+    let past = moves_of(&model, &[nudged(&model, "R1", SMALL_MOVE_MM + 0.01, 0.0)]);
+    assert_eq!(change_of(&past), Change::Placement);
+    let turned = moves_of(&model, &[nudged(&model, "R1", 0.1, 180.0)]);
+    assert_eq!(change_of(&turned), Change::Placement);
+    // Nothing moves: none, and its own line.
+    let none = moves_of(&model, &[nudged(&model, "U1", 0.0, 0.0)]);
+    assert_eq!(change_of(&none), Change::None);
+    assert!(Change::None
+        .line(&none)
+        .unwrap()
+        .contains("nothing to apply"));
+    assert_eq!(Change::Placement.line(&past), None);
+
+    let line = Change::Small.line(&small).unwrap();
+    assert!(
+        line.contains("2 part(s)") && line.contains("0.25 mm"),
+        "{line}"
+    );
+    let mut notes = vec!["old note".to_string()];
+    let mut steps = vec!["old step".to_string()];
+    add_change_note(&mut notes, &mut steps, Some(line.clone()));
+    assert_eq!(notes[0], line);
+    assert!(
+        steps[0].starts_with(&line) && steps[0].contains("decide"),
+        "{steps:?}"
+    );
+    assert_eq!(notes[1], "old note");
+    assert_eq!(steps[1], "old step");
+    // A real placement adds nothing.
+    add_change_note(&mut notes, &mut steps, None);
+    assert_eq!((notes.len(), steps.len()), (2, 2));
 }

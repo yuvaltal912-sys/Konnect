@@ -278,7 +278,10 @@ an unproved outline is not completion evidence.
   is the one plan applied in one batch instead of the small batches above. Then
   steps 5 to 7 of the loop above still apply. A winner whose status is
   **planned_with_gate_failures** is shown with its **gate_failures**; the statuses
-  **no_candidate** and **not_routed** carry no plan.
+  **no_candidate** and **not_routed** carry no plan. Show **winner.moves** too
+  (each part that moves or turns, and by how much): when **winner.change** is
+  `small` (every move at most 0.5 mm, nothing turned) or `none`, say first that
+  the search found no meaningful placement change, so applying it is optional.
 - `place_decoupling_caps`, `auto_place_from_schematic` and
   `refine_placement_force_directed` still refuse any outline that is not a
   provable rectangle; on a rounded or notched board place parts with small
@@ -422,6 +425,16 @@ only when the first is rejected or misses. A group that holds a pair with
 because KiCad checks one `skew` rule for a net; the pair keeps its own `skew`
 rule. `engine: 'freerouting'` tunes nothing and says so in
 `length_matching_note`.
+
+Read the fastroute result's `summary` before reporting it. `summary.lengths.line`
+says whether lengths were checked at all: a call whose intent declares no group
+or pair skew, on a board without length or skew rules, checks none, `status` then
+does not cover lengths, and `completion.not_checked` lists `lengths`. Say so to the
+user; when `summary.lengths.likely_pairs` lists nets named as pairs (CAN_H and
+CAN_L, TX+ and TX-), show them and record the ones the user confirms before
+routing again. `summary.pours.line` says how the pours reached the router: none
+(the DSN has no plane, so add pours before the export), or both ways with each
+way's judged and passing runs and the way the winner took.
 
 ### Freerouting round trip
 

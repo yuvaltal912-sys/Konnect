@@ -2725,3 +2725,129 @@ fn a_pinned_rules_minimum_is_never_negative() {
     // Control: a longer net keeps its own minimum.
     assert!(kicad_group_rule_pinned(&plan.groups[0], "n", 0.6).contains("(min 0.0999mm)"));
 }
+
+// ─── The result's summary of lengths ─────────────────────────────────────────
+
+fn pair_names(pairs: &[LikelyPair]) -> Vec<(&str, &str, &str)> {
+    pairs
+        .iter()
+        .map(|p| (p.positive.as_str(), p.negative.as_str(), p.pattern))
+        .collect()
+}
+
+#[test]
+fn nets_named_as_two_halves_of_a_signal_are_suggested_as_pairs() {
+    let nets = set(&[
+        "/CAN_H", "/CAN_L", "/bus/TX+", "/bus/TX-", "USB_DP", "USB_DM", "RS485_A", "RS485_B",
+        "CANH", "CANL", "LVDS_P", "LVDS_N", "SDA", "SCL",
+    ]);
+    let pairs = likely_pairs(&nets, &BTreeSet::new());
+    assert_eq!(
+        pair_names(&pairs),
+        [
+            ("/CAN_H", "/CAN_L", "_H/_L"),
+            ("/bus/TX+", "/bus/TX-", "+/-"),
+            ("CANH", "CANL", "CANH/CANL"),
+            ("LVDS_P", "LVDS_N", "_P/_N"),
+            ("RS485_A", "RS485_B", "_A/_B (RS-485)"),
+            ("USB_DP", "USB_DM", "_DP/_DM"),
+        ]
+    );
+}
+
+#[test]
+fn rails_declared_pairs_and_lone_halves_are_never_suggested() {
+    let nets = set(&[
+        // Rails and grounds named like halves.
+        "V+", "V-", "/VS+", "/VS-", "+5V_H", "+5V_L", "GND_P", "GND_N",
+        // Encoder phases: A and B without 485 are two signals.
+        "ENC_A", "ENC_B", // A half with no partner.
+        "D+",    // A declared pair.
+        "CAN_H", "CAN_L", // No base before the ending.
+        "_H", "_L", "H", "L",
+    ]);
+    let declared = set(&["CAN_H", "CAN_L"]);
+    let pairs = likely_pairs(&nets, &declared);
+    assert!(pairs.is_empty(), "{pairs:?}");
+    // The negative control of the declared rule: undeclared, the pair is found.
+    assert_eq!(
+        pair_names(&likely_pairs(&nets, &BTreeSet::new())),
+        [("CAN_H", "CAN_L", "_H/_L")]
+    );
+    // And of the 485 rule: the same endings on an RS-485 name are a pair.
+    assert_eq!(
+        pair_names(&likely_pairs(&set(&["/485_A", "/485_B"]), &BTreeSet::new())),
+        [("/485_A", "/485_B", "_A/_B (RS-485)")]
+    );
+}
+
+#[test]
+fn a_plan_that_checks_nothing_says_so_and_lists_the_likely_pairs() {
+    let plan = LengthPlan::default();
+    assert!(!plan.checked());
+    let likely = likely_pairs(&set(&["CAN_H", "CAN_L"]), &BTreeSet::new());
+    let body = plan.summary_json(Some(true), &likely);
+    assert_eq!(body["checked"], false);
+    let line = body["line"].as_str().unwrap();
+    assert!(line.starts_with("Lengths: not checked."), "{line}");
+    assert!(line.contains("`status` does not cover lengths"), "{line}");
+    assert_eq!(body["likely_pairs"][0]["positive"], "CAN_H");
+    assert_eq!(body["likely_pairs"][0]["pattern"], "_H/_L");
+    assert!(body["next_step"]
+        .as_str()
+        .unwrap()
+        .contains("set_design_intent"));
+    // No likely pair: no list and no step.
+    let bare = plan.summary_json(None, &[]);
+    assert!(bare.get("likely_pairs").is_none() && bare.get("next_step").is_none());
+    // An unusable intent's note is carried.
+    let noted = LengthPlan {
+        note: Some("the design intent x cannot be used (bad)".to_string()),
+        ..LengthPlan::default()
+    };
+    assert!(noted.summary_json(None, &[])["line"]
+        .as_str()
+        .unwrap()
+        .contains("Also: the design intent x cannot be used (bad)."));
+}
+
+#[test]
+fn a_plan_with_a_group_or_only_kicad_rules_is_checked() {
+    let plan = two_group_plan();
+    assert!(plan.checked());
+    let body = plan.summary_json(Some(true), &[]);
+    assert_eq!(body["checked"], true);
+    assert!(body["line"]
+        .as_str()
+        .unwrap()
+        .contains("every checked length is inside its window"));
+    assert!(plan.summary_json(Some(false), &[])["line"]
+        .as_str()
+        .unwrap()
+        .contains("outside its window"));
+    // KiCad's own rules alone are checked by the judge (G4(c)).
+    let rules_only = LengthPlan {
+        kicad_rules: vec![KicadLengthRule {
+            name: "len".to_string(),
+            constraints: vec!["(constraint length (max 10mm))".to_string()],
+            condition: None,
+        }],
+        ..LengthPlan::default()
+    };
+    assert!(rules_only.checked());
+    assert_eq!(rules_only.summary_json(None, &[])["checked"], true);
+    // A likely list given to a checked plan is not shown.
+    let likely = likely_pairs(&set(&["CAN_H", "CAN_L"]), &BTreeSet::new());
+    assert!(plan
+        .summary_json(None, &likely)
+        .get("likely_pairs")
+        .is_none());
+}
+
+#[test]
+fn a_net_is_in_one_suggested_pair_at_most() {
+    // Two spellings of one half both find the same partner: one pair only.
+    let pairs = likely_pairs(&set(&["/S_H", "/s_h", "/S_L"]), &BTreeSet::new());
+    assert_eq!(pairs.len(), 1, "{pairs:?}");
+    assert_eq!(pairs[0].negative, "/S_L");
+}
