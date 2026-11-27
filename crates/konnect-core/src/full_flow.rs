@@ -769,6 +769,10 @@ pub(crate) struct FlowRecord {
     pub board_state: BoardState,
     pub steps_asked: Steps,
     pub approvals: Approvals,
+    /// The approvals the start call gave: what a new plan (a resume that plans again)
+    /// keeps; an answer given at gate A was about the plan it saw.
+    #[serde(default)]
+    pub start_approvals: Approvals,
     pub effort: String,
     pub placement_effort: String,
     /// The fastroute binary P0 located (path, version, source).

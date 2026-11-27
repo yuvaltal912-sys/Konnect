@@ -280,6 +280,7 @@ fn planned() -> Planned {
             pour_roles: Some(RolesAnswer::AsNamed(AsNamed::AsNamed)),
             routing: Some(RoutingAnswer::ApplyIfComplete),
         },
+        start_approvals: Approvals::default(),
         effort: "m".to_string(),
         placement_effort: "m".to_string(),
         fastroute: json!({ "path": "/fr/fastroute" }),
@@ -295,6 +296,7 @@ fn planned() -> Planned {
             unlocked_routing: 12,
             zones: 2,
             fill_clean: true,
+            p4_on_winner: true,
             ..PlanFacts::default()
         },
         route: None,
@@ -1809,4 +1811,104 @@ fn m3_gate_r_needs_its_roles_and_m5_keeping_the_placement_plans_the_pours_again(
         "P4 runs again on the current placement"
     );
     assert!(apply_answer(&mut planned().flow, Gate::Plan, &keep, "stale").is_err());
+}
+
+// ─── Review round 2 ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_resume_that_plans_again_keeps_only_the_starts_approvals() {
+    let mut flow = planned().flow;
+    flow.start_approvals = Approvals {
+        routing: Some(RoutingAnswer::ApplyBest),
+        ..Approvals::default()
+    };
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::Placement);
+    flow.records.retain(|r| r.step < Step::Placement);
+    flow.stop_reason = Some("failed: the search failed".into());
+    let fake = Fake::new();
+    let state = tempfile::tempdir().unwrap();
+    resume_step(state.path(), &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.attempt, 2);
+    assert_eq!(flow.approvals.routing, Some(RoutingAnswer::ApplyBest));
+    assert_eq!(
+        flow.approvals.placement, None,
+        "gate A asks the new plan again"
+    );
+    assert_eq!(flow.approvals.pours, None);
+    assert!(
+        flow.approvals.pour_roles.is_some(),
+        "the roles answered at gate R stay"
+    );
+}
+
+#[test]
+fn switching_to_apply_after_the_pours_were_planned_on_the_current_board_plans_again() {
+    let mut flow = planned().flow;
+    flow.facts.p4_on_winner = false;
+    flow.approvals.placement = Some(PlacementAnswer::KeepCurrent);
+    flow.plan_revision = Some("rev".into());
+    flow.gate_body = Some(json!({ "refused": "delete_routing" }));
+    let apply = Approvals {
+        placement: Some(PlacementAnswer::Apply),
+        ..Approvals::default()
+    };
+    apply_answer(&mut flow, Gate::Plan, &apply, "rev").unwrap();
+    assert!(flow.record(Step::PoursAfter).is_none());
+}
+
+#[tokio::test]
+async fn the_refused_gate_names_the_key_and_offers_no_plain_yes() {
+    let mut planned = planned();
+    planned.flow.approvals.delete_routing = Some(DeleteAnswer::Keep);
+    let fake = Fake::new();
+    let flow = leg(&mut planned, &fake).await;
+    let view = view(&planned.state, &flow, None);
+    assert_eq!(view["answer_with"]["answer"], Value::Null);
+    assert!(view["next_steps"][0]
+        .as_str()
+        .unwrap()
+        .contains("delete_routing"));
+}
+
+#[tokio::test]
+async fn a_leg_ended_after_a_read_step_does_not_redo_it() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    fake.route.lock().unwrap()["completion"]["judged"]["all_gates_pass"] = json!(false);
+    leg(&mut planned, &fake).await;
+    let mut flow = planned.flow.clone();
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::Route);
+    resume_step(&planned.state, &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.route_attempt, 1, "the route is not run again");
+    assert!(flow.done(Step::Route));
+}
+
+#[tokio::test]
+async fn a_read_refused_after_a_saved_round_is_not_uncertain() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    // F2a: round 1 adopts a via and DRC still finds one unconnected; round 2's planner
+    // read is refused.
+    fake.script(
+        "run_drc",
+        ok(json!({ "by_rule": [{ "rule": "unconnected_items", "count": 1 }] })),
+    );
+    fake.script("plan_route_refinement", ok(json!({ "proposals": [{ "kind": "stitching", "operations": [{ "tool": "route_batch", "arguments": { "vias": [{ "x": 1.0 }] } }] }] })));
+    fake.script(
+        "plan_route_refinement",
+        Called::Answered(CallToolResult::error("busy")),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.at, Some(Step::PlaneStitch));
+    let record = flow.record(Step::PlaneStitch).unwrap();
+    assert_eq!(record.state, StepState::Failed, "{:?}", record.why);
+    assert_eq!(record.rounds.len(), 1);
 }

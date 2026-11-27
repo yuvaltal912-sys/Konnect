@@ -908,6 +908,7 @@ async fn start(
         board_state: BoardState::Unchanged,
         steps_asked: call.steps,
         approvals: call.approve.clone(),
+        start_approvals: call.approve.clone(),
         effort,
         placement_effort: call
             .placement_effort
@@ -1915,7 +1916,7 @@ impl Calls<'_> {
             }
             // A refusal after an earlier write of the same step: the board holds that
             // write, unsaved (M5).
-            Outcome::Failed if self.wrote => Err(Halt::MayHaveChanged(format!(
+            Outcome::Failed if self.wrote && writes => Err(Halt::MayHaveChanged(format!(
                 "{tool} refused after an earlier call of this step changed the board, which KiCad holds unsaved: {}",
                 short(&body)
             ))),
@@ -2336,6 +2337,8 @@ async fn stitch_rounds(
                 Ok(after) => {
                     rounds.push(after.clone());
                     calls.rounds.push(after);
+                    // The round is saved and verified: a later refusal starts clean.
+                    calls.wrote = false;
                 }
                 Err(why) => return Ok(Err(Halt::MayHaveChanged(why))),
             }
@@ -2864,6 +2867,19 @@ fn view(state: &Path, flow: &FlowRecord, running: Option<(&Value, f64)>) -> Valu
                 "expected_plan_revision": flow.plan_revision,
             });
             let undecided: Vec<&str> = needs.iter().filter(|n| n.recommended.is_none()).map(|n| n.key).collect();
+            if let Some(refused) = body["gate"]["refused"].as_str().map(str::to_string) {
+                // A refused combination: no plain yes answers it (M4).
+                body["answer_with"]["answer"] = Value::Null;
+                body["next_steps"] = json!([
+                    format!("The approvals are refused: {refused}"),
+                    format!(
+                        "Show the user the plan in `gate` and the refusal. Call run_full_flow with {{\"run_id\": \"{}\", \"answer\": {{<the key the refusal names>: <its new value>}}, \"expected_plan_revision\": \"{}\"}}; any key may change here. Or abandon the flow.",
+                        flow.flow_id,
+                        flow.plan_revision.clone().unwrap_or_default()
+                    ),
+                ]);
+                return body;
+            }
             let mut steps = vec![format!(
                 "Show the user the plan in `gate` ({}). On a plain yes call run_full_flow with `answer_with` unchanged; otherwise change the keys the user named.",
                 gate.name()
@@ -3108,10 +3124,18 @@ fn apply_answer(
         )));
     }
     let roles_changed = gate == Gate::Plan && flow.approvals.roles_changed(given);
-    let kept_after_winner = gate == Gate::Plan
-        && merged.placement == Some(PlacementAnswer::KeepCurrent)
-        && flow.facts.p4_on_winner;
-    let replan = roles_changed || kept_after_winner;
+    // P4 planned on the board the flow will build: the winner when the placement is
+    // applied, else the current one. An answer that changes which one plans again.
+    let will_apply = merged.placement == Some(PlacementAnswer::Apply)
+        && flow
+            .facts
+            .change
+            .as_deref()
+            .is_some_and(|change| change != "none");
+    let base_changed = gate == Gate::Plan
+        && flow.finished(Step::PoursAfter)
+        && will_apply != flow.facts.p4_on_winner;
+    let replan = roles_changed || base_changed;
     if gate == Gate::Roles {
         if let Some(need) = needs_roles(&flow.facts.named_only, &merged) {
             return Err(invalid_arg(
@@ -3212,6 +3236,12 @@ async fn resume_step(
     let Some(step) = flow.at else {
         return Ok(Err("The flow stopped before any step.".to_string()));
     };
+    if flow.finished(step) {
+        // Stopped between two steps (m2): the next step runs as usual.
+        flow.state = FlowState::Running;
+        flow.stop_reason = None;
+        return Ok(Ok(()));
+    }
     if flow
         .stop_reason
         .as_deref()
@@ -3227,6 +3257,12 @@ async fn resume_step(
         if step <= Step::PoursAfter {
             flow.records.retain(|record| record.step == Step::Preflight);
             flow.attempt += 1;
+            // A new plan: only what the start call approved in advance holds, and gate A
+            // asks the rest again. The roles answered at gate R stay.
+            let roles = flow.approvals.pour_roles.clone();
+            flow.approvals = flow.start_approvals.clone();
+            flow.approvals.pour_roles = flow.approvals.pour_roles.clone().or(roles);
+            flow.facts = PlanFacts::default();
         } else if (Step::Export..=Step::ImportCheck).contains(&step) {
             flow.records.retain(|record| record.step < Step::Export);
             flow.route_attempt += 1;
@@ -3240,23 +3276,19 @@ async fn resume_step(
     let Some(record) = flow.record(step).cloned() else {
         return Ok(Err(format!("{} has no record to resume from.", step.id())));
     };
-    if record.state.finished() {
-        // Stopped between two steps (m2): the next step runs as usual.
-        flow.state = FlowState::Running;
-        flow.stop_reason = None;
-        return Ok(Ok(()));
-    }
     if record.before.is_none() {
         // The step stopped before its intent was recorded, so no call was sent (M1). It
-        // runs again, and its own checks decide; a board that changed is refused here.
-        if flow
-            .stop_reason
-            .as_deref()
-            .is_some_and(|why| why.starts_with("board_changed"))
+        // runs again when the board is where the step before left it, which the user may
+        // have put right since (saved, or restored).
+        let at = match live_equals_saved(io).await {
+            Ok((_, saved)) => saved,
+            Err(stop) => return Ok(Err(format!("The board is not ready: {}.", stop.why))),
+        };
+        if let LiveStart::Changed { expected, found } =
+            plan_live_step(&at, &flow.expected_before(step))
         {
             return Ok(Err(format!(
-                "The flow stopped because the board changed ({}). Restore the board or abandon the flow.",
-                flow.stop_reason.clone().unwrap_or_default()
+                "board_changed: the saved board is {found}, and the step before left it at {expected}. Restore the board or abandon the flow."
             )));
         }
         flow.records.retain(|r| r.step != step);

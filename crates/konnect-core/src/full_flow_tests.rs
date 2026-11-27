@@ -36,6 +36,7 @@ fn flow() -> FlowRecord {
         board_state: BoardState::Unchanged,
         steps_asked: Steps::default(),
         approvals: Approvals::default(),
+        start_approvals: Approvals::default(),
         effort: "m".to_string(),
         placement_effort: "m".to_string(),
         fastroute: json!({}),
