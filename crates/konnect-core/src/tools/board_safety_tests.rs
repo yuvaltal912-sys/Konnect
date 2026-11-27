@@ -987,3 +987,228 @@ async fn the_registry_wraps_every_bulk_edit() {
         result.content
     );
 }
+
+// ─── delete_all_routing ──────────────────────────────────────────────────────
+
+/// `delete_all_routing`, as the registry builds it.
+fn registered_delete_all_routing() -> ToolDef {
+    crate::router::registry::ALL_TOOLSETS
+        .iter()
+        .flat_map(|set| crate::router::registry::tools_for(set.name).unwrap())
+        .find(|tool| tool.name == "delete_all_routing")
+        .expect("registered")
+}
+
+fn fake_delete_all_routing(calls: Arc<AtomicUsize>) -> ToolDef {
+    board_safety::guard(fake_bulk_edit(
+        "delete_all_routing",
+        BoardAccess::LiveOnly,
+        calls,
+        ok_reply,
+    ))
+}
+
+/// A preview of `delete_all_routing` (no `dry_run`, or `dry_run: true`) runs
+/// the tool and takes no checkpoint; its result carries no note. So does a
+/// `dry_run` that is not a boolean, which the tool refuses: only `false` deletes.
+#[tokio::test]
+async fn a_delete_all_routing_preview_takes_no_checkpoint() {
+    for args in [
+        json!({}),
+        json!({ "dry_run": true }),
+        json!({ "dry_run": "false" }),
+        json!({ "dry_run": null }),
+        json!({ "dry_run": 0 }),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, board) = project(dir.path());
+        let server = spawn_kicad_holding(&board, BOARD_TEXT);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool = fake_delete_all_routing(calls.clone());
+        let mut call_args = args.clone();
+        call_args["board"] = json!(board);
+        let result = (tool.handler)(
+            &call_args,
+            arc(ctx_talking_to(server.address().to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{args}: the tool ran");
+        assert!(
+            checkpoint_ids(dir.path()).is_empty(),
+            "{args}: no checkpoint"
+        );
+        assert!(
+            body_of(&result).get("live_project").is_none(),
+            "{args}: no note"
+        );
+    }
+}
+
+/// The apply (`dry_run: false`) of a live board: checkpoint first, then the
+/// tool, and the note with Undo, as for the other bulk edits.
+#[tokio::test]
+async fn a_delete_all_routing_apply_checkpoints_first_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = fake_delete_all_routing(calls.clone());
+    let result = (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let note = body_of(&result)["live_project"].clone();
+    let id = note["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .expect("a checkpoint")
+        .to_string();
+    assert_eq!(checkpoint_ids(dir.path()), vec![id.clone()]);
+    assert_eq!(note["board_open_in_kicad"], true, "{note}");
+    assert_eq!(note["checkpoint"]["made_by_this_call"], true, "{note}");
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            dir.path()
+                .join(format!(".konnect/checkpoints/{id}/manifest.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["label"], "automatic: before delete_all_routing",
+        "{manifest}"
+    );
+    let summary = note["summary"].as_str().unwrap();
+    assert!(summary.contains("Edit > Undo"), "{summary}");
+}
+
+/// The apply when no checkpoint can be made: refused, and the tool never ran,
+/// so nothing was deleted.
+#[tokio::test]
+async fn a_delete_all_routing_apply_without_a_checkpoint_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    std::fs::write(dir.path().join("amp.kicad_sch"), [0xff, 0xfe, 0x00]).unwrap();
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = fake_delete_all_routing(calls.clone());
+    let result = (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the tool did not run");
+    let message = message_of(&result);
+    assert!(message.starts_with("Nothing was changed"), "{message}");
+    assert!(message.contains("delete_all_routing"), "{message}");
+}
+
+/// The registered tool is wrapped: its preview takes no checkpoint, and its
+/// apply takes one before the tool refuses a stale revision.
+#[tokio::test]
+async fn the_registered_delete_all_routing_checkpoints_its_apply_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let ctx = arc(ctx_talking_to(server.address().to_string()));
+    let tool = registered_delete_all_routing();
+
+    let preview = (tool.handler)(&json!({ "board": board }), ctx.clone())
+        .await
+        .unwrap();
+    assert!(
+        checkpoint_ids(dir.path()).is_empty(),
+        "{:?}",
+        preview.content
+    );
+
+    let apply = (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "stale" }),
+        ctx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        apply.is_error,
+        "a stale revision is refused: {:?}",
+        apply.content
+    );
+    assert_eq!(
+        crate::mcp::error::extract_error_kind(&apply).as_deref(),
+        Some("stale_target"),
+        "{:?}",
+        apply.content
+    );
+    assert!(
+        text_of(&apply).contains("Nothing was deleted"),
+        "{:?}",
+        apply.content
+    );
+    assert_eq!(checkpoint_ids(dir.path()).len(), 1, "{:?}", apply.content);
+    // The refusal's JSON body carries the note: no change known, no Undo.
+    let summary = body_of(&apply)["live_project"]["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        summary.contains("no change to the board is known"),
+        "{:?}",
+        apply.content
+    );
+    assert!(!summary.contains("Undo"), "{summary}");
+}
+
+/// An apply on a board with nothing to delete (`status: "noop"`) changed
+/// nothing: the note offers no Undo, which would revert the user's own edit.
+#[tokio::test]
+async fn a_delete_all_routing_apply_that_changed_nothing_offers_no_undo() {
+    fn noop_reply() -> CallToolResult {
+        CallToolResult::json(&json!({ "status": "noop", "dry_run": false }))
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let tool = board_safety::guard(fake_bulk_edit(
+        "delete_all_routing",
+        BoardAccess::LiveOnly,
+        Arc::new(AtomicUsize::new(0)),
+        noop_reply,
+    ));
+    let result = (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    let summary = body_of(&result)["live_project"]["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(summary.contains("changed nothing"), "{summary}");
+    assert!(!summary.contains("Undo"), "{summary}");
+    assert!(!summary.contains("edited"), "{summary}");
+}
+
+/// The apply where KiCad answers that it holds no PCB editor: the live-only
+/// tool runs to refuse on its own, and no checkpoint is taken.
+#[tokio::test]
+async fn a_delete_all_routing_apply_of_a_board_not_open_takes_no_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsUnhandled);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = fake_delete_all_routing(calls.clone());
+    (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the tool ran, to refuse");
+    assert!(checkpoint_ids(dir.path()).is_empty());
+}
