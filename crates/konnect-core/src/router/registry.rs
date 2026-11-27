@@ -162,7 +162,11 @@ fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
             .iter()
             .map(|toolset| {
                 let tools = build_tools_for(toolset.name)
-                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name));
+                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name))
+                    .into_iter()
+                    // Row BS: the bulk edits checkpoint the project first.
+                    .map(crate::tools::board_safety::guard)
+                    .collect();
                 (toolset.name, tools)
             })
             .collect()
