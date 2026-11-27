@@ -415,3 +415,97 @@ async fn a_claim_never_names_a_run_that_has_ended() {
     assert_eq!(busy.run_id, None);
     drop(held);
 }
+
+#[tokio::test]
+async fn a_running_record_beside_its_result_is_done() {
+    let run = run_place();
+    let folder = left_running(&run, FIRST);
+    write_json(&folder.join(RESULT_FILE), &json!({ "status": "planned" })).unwrap();
+    let report = Jobs::default()
+        .report(&run.state, &KIND, FIRST, Duration::ZERO)
+        .await;
+    let Report::Done { result, .. } = report else {
+        panic!("{report:?}");
+    };
+    assert_eq!(result, json!({ "status": "planned" }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_on_another_process_run_lasts_the_wait_asked() {
+    let run = run_place();
+    let folder = left_running(&run, FIRST);
+    let lock = File::open(folder.join(LOCK_FILE)).unwrap();
+    lock.try_lock().unwrap();
+    for wait in [Duration::from_millis(700), Duration::from_millis(2_600)] {
+        let waited = Instant::now();
+        let report = Jobs::default().report(&run.state, &KIND, FIRST, wait).await;
+        let took = waited.elapsed();
+        assert!(
+            matches!(report, Report::Running { here: false, .. }),
+            "{report:?}"
+        );
+        assert!(took >= wait, "{took:?} < {wait:?}");
+        assert!(took < wait + Duration::from_secs(1), "{took:?}");
+    }
+    drop(lock);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_busy_probe_names_the_running_run_and_keeps_no_lock() {
+    let run = run_place();
+    assert_eq!(board_busy(&run.state, &KIND, &run.board).unwrap(), None);
+    // The probe took and released the lock: the board can still be claimed.
+    let claim = claim_board(&run.state, &KIND, &run.board, FIRST)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        board_busy(&run.state, &KIND, &run.board).unwrap(),
+        Some(Busy {
+            run_id: Some(FIRST.to_string())
+        }),
+        "a run that is starting (no record yet) is named"
+    );
+    // Its record says running beside a free lock: an interrupted run is named by no one.
+    left_running(&run, FIRST);
+    assert_eq!(
+        board_busy(&run.state, &KIND, &run.board).unwrap(),
+        Some(Busy { run_id: None })
+    );
+    drop(claim);
+    assert_eq!(board_busy(&run.state, &KIND, &run.board).unwrap(), None);
+}
+
+/// One thread for the caller's runtime: if the run's work ran there, its blocking would
+/// hold every report until it ended.
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_that_blocks_does_not_hold_the_callers_runtime() {
+    let run = run_place();
+    let jobs = Jobs::default();
+    start(
+        &jobs,
+        &run,
+        &run.board,
+        FIRST,
+        Arc::new(Count::default()),
+        async {
+            std::thread::sleep(Duration::from_millis(1_500));
+            Ok(json!({}))
+        },
+    );
+    tokio::task::yield_now().await;
+    let waited = Instant::now();
+    let report = jobs
+        .report(&run.state, &KIND, FIRST, Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(report, Report::Running { here: true, .. }),
+        "{report:?}"
+    );
+    assert!(
+        waited.elapsed() < Duration::from_millis(1_000),
+        "{:?}",
+        waited.elapsed()
+    );
+    let report = jobs.report(&run.state, &KIND, FIRST, LONG).await;
+    assert!(matches!(report, Report::Done { .. }), "{report:?}");
+}

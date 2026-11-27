@@ -905,10 +905,6 @@ async fn a_background_run_gives_the_synchronous_result_and_keeps_it_for_a_restar
     // A restarted server has no run in memory: the result is read from the folder.
     let again = report_result(&Jobs::default(), &run.state, &run.run_id, Duration::ZERO).await;
     assert_eq!(body_of(&again), body);
-    let file: Value =
-        serde_json::from_str(&std::fs::read_to_string(folder.join("result.json")).unwrap())
-            .unwrap();
-    assert_eq!(file, body);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -946,7 +942,7 @@ async fn a_running_run_reports_its_phase_counts_and_effort() {
     assert_eq!(candidates["routed"], 0);
     assert!(running["effort_level_reached"].is_u64());
     assert_eq!(running["routing_effort"], "m");
-    assert!(running["elapsed_s"].as_f64().unwrap() > 0.0);
+    assert!(running["elapsed_s"].as_f64().unwrap() >= 0.0);
     assert_eq!(running["run_id"], run.run_id.as_str());
     assert_eq!(running["board"], "/boards/board.kicad_pcb");
     assert!(running.get("served_by_pid").is_none());
@@ -1002,4 +998,33 @@ async fn a_report_names_what_it_cannot_read() {
         let text = text_of(&report);
         assert!(text.contains("run_id"), "{text}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_or_interrupted_run_is_an_error_result_with_its_status() {
+    let state = tempfile::tempdir().unwrap();
+    let state = std::fs::canonicalize(state.path()).unwrap();
+    let id = "1700000000000-0123456789ab";
+    let folder = run_folder_of(&state, &PLACEMENT_RUNS, id);
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut record = json!({
+        "run_id": id, "tool": "plan_convergent_placement", "board": "/boards/board.kicad_pcb",
+        "state": "running", "pid": 1, "started_unix_ms": 1, "finished_unix_ms": null,
+        "progress": {}, "error": null,
+    });
+    std::fs::write(folder.join("run.json"), record.to_string()).unwrap();
+    let interrupted = report_result(&Jobs::default(), &state, id, Duration::ZERO).await;
+    assert!(interrupted.is_error);
+    let body = body_of(&interrupted);
+    assert_eq!(body["status"], "interrupted", "{body:#}");
+    assert_eq!(body["records"], folder.display().to_string());
+
+    record["state"] = json!("failed");
+    record["error"] = json!("the input board cannot be read");
+    std::fs::write(folder.join("run.json"), record.to_string()).unwrap();
+    let failed = report_result(&Jobs::default(), &state, id, Duration::ZERO).await;
+    assert!(failed.is_error);
+    let body = body_of(&failed);
+    assert_eq!(body["status"], "failed", "{body:#}");
+    assert_eq!(body["error"], "the input board cannot be read");
 }

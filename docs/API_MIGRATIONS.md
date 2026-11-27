@@ -21,16 +21,19 @@ its result was lost.
   `judged`, `routed`), `effort_level_reached` (family C's effort level),
   `routing_effort`, `records` and `next_steps`. A run of another Konnect process adds
   `served_by_pid` and `progress_as_of`; its progress is the last one it wrote (every
-  10 s).
+  10 s). `converge_runs` also counts the starts a stop rule discarded, so it can end
+  above the result's `search.converge_runs`.
 - **A finished run** answers the whole result as before (`status` `planned`,
   `planned_with_gate_failures`, `no_candidate` or `not_routed`, `apply_with`,
   `winner.moves`, `winner.change`, ...) plus `run_id`. It is kept in the run folder
   (`result.json`, beside `run.json`, the run's record), so the same call reads it
   after a server restart, as long as the folder exists.
-- **Errors:** a failed run is an error result naming its reason; a run whose server
-  stopped before it ended is an error result that says `did not finish`
-  (interrupted). A second start on a board with a run is refused and names the
-  running `run_id`. An unknown or malformed `run_id` is an argument error.
+- **Errors:** a failed run is an error result with `status: failed`, `error`,
+  `run_id`, `board`, `records` and `next_steps`; a run whose server stopped before it
+  ended is the same with `status: interrupted`. A second start on a board with a run
+  is refused, before KiCad is read, and names the running `run_id`. An unknown or
+  malformed `run_id` is an argument error. A report call needs neither KiCad nor the
+  board open.
 - **No synchronous mode** and no cancellation: no caller needs either, and a
   cancel could not be shown to leave no router process behind without starting one.
   A board's run ends by its own stop rules.

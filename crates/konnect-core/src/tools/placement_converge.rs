@@ -19,7 +19,9 @@
 //! server has restarted.
 
 use crate::fastroute::{self, Binary, Located};
-use crate::jobs::{claim_board, run_folder_of, BoardClaim, Busy, JobKind, Jobs, Progress, Report};
+use crate::jobs::{
+    board_busy, claim_board, run_folder_of, BoardClaim, Busy, JobKind, Jobs, Progress, Report,
+};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::place_converge::{ConvergeParams, OuterRule};
@@ -82,7 +84,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          `phase`, `candidates`, `elapsed_s`) and, once it has ended, the whole result \
          described below. One run per board at a time: a second start is refused and \
          names the running id. A finished run's result stays in its run folder, so \
-         `run_id` reads it later too, after a server restart. \
+         `run_id` reads it later too, after a server restart. A call with `run_id` needs \
+         neither KiCad nor the board open. A run that failed is `status: failed` with its \
+         `error`, and one whose server stopped before it ended is `status: interrupted`; \
+         both are error results. \
          Read-only: nothing on the board changes. The board must be open in KiCad, and the \
          only board open: its live text and KiCad's own routing rules are read at the start \
          (twice, and both reads must agree). Every footprint KiCad marks locked stays where \
@@ -162,12 +167,18 @@ async fn handle_plan_convergent_placement(
             ))
         }
     };
+    let state = konnect_sexp::writer::state_root()
+        .map_err(|error| anyhow::anyhow!("Konnect's state folder: {error}"))?;
+    // A board with a run is refused before KiCad is asked anything, so the refusal names
+    // the run even when KiCad is closed. The claim below is the guard; this is its answer
+    // ahead of time.
+    if let Some(busy) = board_busy(&state, &PLACEMENT_RUNS, &board)? {
+        return Ok(busy_result(&busy));
+    }
     let live = match live_input(ctx, &board).await? {
         Ok(live) => live,
         Err(refusal) => return Ok(refusal),
     };
-    let state = konnect_sexp::writer::state_root()
-        .map_err(|error| anyhow::anyhow!("Konnect's state folder: {error}"))?;
     let stamp = stamp();
     let run_id = run_name(&live.text, &stamp);
     // The claim comes before the run folder, so a refused start leaves nothing behind.
@@ -682,6 +693,13 @@ fn busy_result(busy: &Busy) -> CallToolResult {
     })
 }
 
+/// `body` as an error result: a run that ended without a plan.
+fn error_json(body: &Value) -> CallToolResult {
+    let mut result = CallToolResult::json(body);
+    result.is_error = true;
+    result
+}
+
 /// The answer to a call with `run_id`, after waiting up to `wait` for the run to end.
 pub(crate) async fn report_result(
     jobs: &Jobs,
@@ -722,17 +740,26 @@ pub(crate) async fn report_result(
             )]);
             CallToolResult::json(&body)
         }
-        Report::Failed { record } => CallToolResult::error(format!(
-            "Run {} failed: {}. Nothing was planned; its records are in '{}'.",
-            record.run_id,
-            record.error.as_deref().unwrap_or("no reason was recorded"),
-            folder.display()
-        )),
-        Report::Interrupted { record } => CallToolResult::error(format!(
-            "Run {} did not finish: the Konnect server that ran it stopped before it ended. Nothing was planned; its partial records are in '{}'. Start a new run with board.",
-            record.run_id,
-            folder.display()
-        )),
+        Report::Failed { record } => error_json(&json!({
+            "status": "failed",
+            "run_id": record.run_id,
+            "board": record.board,
+            "error": record.error.as_deref().unwrap_or("no reason was recorded"),
+            "records": folder.display().to_string(),
+            "next_steps": [
+                "Nothing was planned. Tell the user the error; fix what it names, then start a new run with board.",
+            ],
+        })),
+        Report::Interrupted { record } => error_json(&json!({
+            "status": "interrupted",
+            "run_id": record.run_id,
+            "board": record.board,
+            "error": "the Konnect server that ran it stopped before it ended",
+            "records": folder.display().to_string(),
+            "next_steps": [
+                "Nothing was planned (the partial records are in `records`). Start a new run with board.",
+            ],
+        })),
         Report::Unknown { why } => invalid_arg("run_id", &why),
     }
 }

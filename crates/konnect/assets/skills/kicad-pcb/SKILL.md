@@ -278,9 +278,10 @@ an unproved outline is not completion evidence.
   limit) and tell the user the **phase** and **candidates** counts each time, until
   **status** is no longer `running`; that answer is the whole plan. A second start
   on the same board is refused and names the running id: report that run instead.
-  The result stays in the run folder, so the same call reads it later, after a
-  server restart too; `interrupted` means the server stopped before the run ended,
-  so start a new one. Show the user **winner**, **candidates** and **notes**; only on
+  A report call needs neither KiCad nor the board open. The result stays in the run
+  folder, so the same call reads it later, after a server restart too. **status**
+  `failed` (with its **error**) or `interrupted` (the server stopped before the run
+  ended) carries no plan: tell the user and start a new run. Show the user **winner**, **candidates** and **notes**; only on
   their explicit OK call `create_checkpoint`, then `set_component_placements` with
   **apply_with.arguments** exactly as returned: the plan is legal as a whole, so it
   is the one plan applied in one batch instead of the small batches above. Then

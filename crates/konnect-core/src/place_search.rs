@@ -1362,7 +1362,9 @@ pub(crate) struct ProgressSnapshot {
     /// Phase 1's candidates made so far, of `generate_total` (0 until phase 1 starts).
     pub generated: usize,
     pub generate_total: usize,
-    /// Family C's runs made so far: the starts, then one per effort level.
+    /// Family C's runs made so far: the starts, then one per effort level. It counts
+    /// the starts that were running when the stop rule ended the starts too, whose
+    /// records the search drops, so it can end above the result's `converge_runs`.
     pub converge_runs: usize,
     /// The highest effort level of family C's runs made so far (0: the starts only).
     pub effort_level: usize,
@@ -1414,6 +1416,15 @@ impl SearchProgress {
     }
 }
 
+/// Tells a [`SearchProgress`] that one candidate was made, when dropped.
+struct Made<'a>(&'a SearchProgress, &'a Recipe);
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        self.0.made(self.1);
+    }
+}
+
 /// [`search_observed`] with no one asking.
 pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::Result<Outcome> {
     search_observed(plan, routing, &SearchProgress::default()).await
@@ -1435,9 +1446,10 @@ pub(crate) async fn search_observed(
 ) -> anyhow::Result<Outcome> {
     let started = Instant::now();
     let counted = |model: &BoardModel, recipe: &Recipe| {
-        let made = generate(model, recipe);
-        progress.made(recipe);
-        made
+        // Counted on the way out, a panic's unwind too: a generator that panics is a
+        // `generate_failed` record, so it was made.
+        let _made = Made(progress, recipe);
+        generate(model, recipe)
     };
     let (model, schematic) = search_model(plan)?;
     std::fs::create_dir_all(plan.folder.join("candidates"))?;
