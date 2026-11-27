@@ -482,6 +482,12 @@ When the user asks for Freerouting (`engine: 'freerouting'`), use the local Free
    reverse manifest together. Rust export is the default
    (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
    output files are refused. Do not change the board while routing this revision.
+   If the export refuses unlocked routing, remove it in one call, not item by
+   item: `delete_all_routing(board)` previews what goes (by kind, net and
+   layer) and what stays (locked routing; zones, footprints and graphics are
+   never deleted); tell the user the counts, then apply with
+   `delete_all_routing(board, dry_run=false, expected_plan_revision=...)`,
+   `save_project`, and export again. One Ctrl+Z in KiCad undoes the delete.
 3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses',
    engine='freerouting', jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
    and writes a new SES; creating that file does not prove every net was routed.
@@ -523,8 +529,9 @@ When the user asks for Freerouting (`engine: 'freerouting'`), use the local Free
 7. If any pour went to the router as a plane (`completion.planes` is not
    empty), follow `completion.next_steps`. The checkpoint taken before step 4
    keeps the exported board: the fallback needs it back, because
-   `export_specctra_dsn` refuses a board that holds unlocked routing. After
-   the import, stitch.
+   `export_specctra_dsn` refuses a board that holds unlocked routing. (With
+   KiCad still open, `delete_all_routing` removes that routing instead,
+   preview then apply, and keeps the locked wiring.) After the import, stitch.
    Call `plan_route_refinement(board, kinds=['stitching'], nets=[the plane
    nets], search_radius_mm=3)` with the effort chosen for this task, adopt the
    stitching vias you support with `route_batch`, then refill and run DRC
@@ -566,8 +573,8 @@ still be routed narrower than its current needs; the routing result's
 `width_exceptions` names each such stretch (step 3). Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
-Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,
-custom DRC rules, incomplete routing rules, blind/buried vias, copper
+Unlocked routing (remove it with `delete_all_routing`), routed arcs, custom
+pad shapes, local clearance overrides, custom DRC rules, incomplete routing rules, blind/buried vias, copper
 dimensions and KiCad `jumper` layers are refused. Boards with back-side parts
 use the Rust exporter: KiCad's native exporter is not adopted for them.
 
@@ -870,7 +877,8 @@ vias. It is not an autorouter and does not replace the Freerouting failure rule.
 Inspect readback IDs and the outcome before continuing. Live netclasses supply
 omitted widths and via dimensions; narrower widths and ambiguous pad routes
 refuse. Use `modify_trace` for partial in-place edits and `query_vias` /
-`delete_via` for observed via identities. A successful edit still needs the
+`delete_via` for observed via identities; `delete_all_routing` removes every
+unlocked track, arc and via at once. A successful edit still needs the
 relevant clearance/connectivity checks; an uncertain result needs live-board
 inspection before retrying.
 

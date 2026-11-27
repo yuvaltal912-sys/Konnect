@@ -3,6 +3,38 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `delete_all_routing`, one call for all routing (Row DR)
+
+**A new tool, nothing removed or renamed.** `delete_all_routing` (toolset `pcb_routing`,
+live KiCad only) removes every track, arc and via from the open board in one KiCad undo
+step. Before it, a board that `export_specctra_dsn` refused for unlocked routing needed one
+`delete_trace` or `delete_via` call per item.
+
+- `delete_all_routing(board)`: the preview (`dry_run`, default `true`) changes nothing.
+  It returns `will_delete` (`total`, `tracks`, `arcs`, `vias`, `by_net` (at most 100 nets,
+  largest first, with `nets_total`), `by_layer`, where a via's layer is its span, such as
+  `F.Cu-B.Cu`), `kept_locked`, `never_touched` and `plan_revision`; `status` is `ready`
+  or `noop`.
+- `delete_all_routing(board, dry_run=false, expected_plan_revision=...)`: the apply.
+  `expected_plan_revision` is required, and any change to the board since the preview,
+  or a different `include_locked`, makes it `stale_target`; nothing is deleted. The
+  apply reads the board back and returns `removed` (as `will_delete`), `routing_left`
+  and `never_touched` (the linked objects KiCad may update with their tracks, before and
+  after: teardrop zones, groups, generated tuning patterns). A planned item still on the
+  board, a locked item gone, a new routing item or any other object changed is
+  `mutation_outcome_uncertain` and names what differs. The board is not saved.
+- `include_locked` (default `false`): locked tracks, arcs and vias, and routing held by a
+  locked group (nested groups too), are kept unless it is `true`. `kept_locked` counts
+  them (`held_only_by_locked_groups`) and lists in `export_will_refuse` the kept items
+  `export_specctra_dsn` would still refuse (a group-only lock, locked arcs, blind or
+  micro vias, vias that are not through vias, drills it cannot take, no net, zero-length
+  tracks, a lock written the old way).
+- Only top-level `segment`, `arc` and `via` items are sent to KiCad for deletion. Zones,
+  footprints, graphics and text never are; KiCad itself may remove the teardrop zones,
+  tuning patterns and routing-only groups that belong to deleted tracks, which
+  `never_touched.kicad_updated` says (for example "KiCad removed 4 teardrop_zones with
+  their tracks").
+
 ## Unreleased: board safety (Row BS)
 
 **A behaviour change** for `route_specctra_dsn`, plus additive fields.

@@ -5,6 +5,8 @@
 
 #[path = "pcb_routing_batch.rs"]
 mod batch;
+#[path = "pcb_routing_clear.rs"]
+mod clear;
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -354,6 +356,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ];
     tools.extend(batch::tools());
+    tools.extend(clear::tools());
     tools.extend(super::route_refine::tools());
     tools
 }

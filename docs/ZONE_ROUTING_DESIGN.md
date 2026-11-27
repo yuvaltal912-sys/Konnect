@@ -2632,7 +2632,7 @@ folder. Records: `target/creation-research/zone-routing/zr6/` in the main checko
   schema_parameter_usage --test doc_tool_counts`): 12, 6 and 5 passed on the final tree.
   `asset_references` first caught the skill's two new result fields as phantom tool names;
   they are in its `NOT_TOOLS`. `cargo xtask fix-doc-counts`: "documentation already
-  current" (271 registered, 278 with the meta-tools, after ZR4).
+  current" (with the tool counts of ZR4).
 - **Clippy** `-D warnings` on `konnect-core --lib --tests`: clean. `cargo fmt --all --
   --check`: clean.
 - **Negative controls:** 48 (C01 to C48), each a broken guard, its test run, at least one

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **22 toolsets** organized into 11 categories
-- **271 registered tools** + **7 always-visible meta-tools** = **278 total**
+- **272 registered tools** + **7 always-visible meta-tools** = **279 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -293,8 +293,8 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the saved board with kicad-cli and return a PNG image block. Accepts `side` (`top` or `bottom`, default `top`) and positive `zoom` (default 1); width/height retain their 100–4000 pixel clamps. This is an orthographic 3D render; use `export_svg` for layer-aware 2D output. |
 
-### `pcb_routing` · 19 tools
-**Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
+### `pcb_routing` · 20 tools
+**Purpose:** Traces, vias, copper pours, net classes, differential pairs, deleting all routing, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
@@ -314,6 +314,7 @@ The three `board_construction` writers (`set_footprint_lock` with `locked`, `add
 | `plan_route_refinement` | Read-only second opinion on the saved board: propose same-net through stitching vias, perpendicular acute-T repairs and 45-degree pad-exit chamfers within a conservative two/four-layer rule/geometry profile and a bounded effort (`quick`, `standard`, `deep` or a custom budget). Returns source hashes, object preimages, ordered ordinary-tool operations, dependencies and blocked/partial coverage; never applies, saves or refills. Refill/save first, compare independently, then selectively create with `route_batch` or update with `modify_trace`; adoption spans calls and requires fresh native DRC and layout audit. Saved fill freshness remains unestablished. |
 | `query_vias` | List live vias by net with KIIDs, positions, span and dimensions; paged and byte-bounded. |
 | `delete_via` | Delete an observed unlocked via by KIID and verify absence while preserving other routing objects. |
+| `delete_all_routing` | Remove every track, arc and via from the live board in one undo step, e.g. before `export_specctra_dsn`. The preview (`dry_run`, the default) counts what goes by kind, net and layer and returns `plan_revision`; the apply needs it and refuses if the board changed. Locked routing stays unless `include_locked`; zones, footprints and graphics are never deleted, and the read-back proves it. Not saved. |
 | `create_netclass` | Create or update a netclass in the project's `net_settings` (the sibling `.kicad_pro`, where KiCad keeps netclasses since v7). Never touches the board file. An update changes only the settings named; use `get_netclasses` to look, since naming an unknown class here creates it. Works while KiCad 10.0.7 or later holds the board: KiCad's own copy first over IPC, read back, then the file (`written_to`); `kicad.kicad_unsaved` lists what KiCad holds and has not saved. |
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Mixed-source: definitions and patterns come from the `.kicad_pro`, the board nets from a live KiCad where one holds the board and from the saved board file otherwise (`board_source` selects that), and `sources` names each. KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. `kicad_unsaved` lists the settings a KiCad holding the board has in memory and its file does not. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. Refuses while KiCad holds the board (no IPC command for patterns) and names the Board Setup steps instead. |
