@@ -813,6 +813,25 @@ fn a_group_holding_a_tuning_pattern_is_not_a_false_alarm() {
 }
 
 #[test]
+fn a_group_of_a_track_and_its_tuning_pattern_is_linked() {
+    let generated = r#"(generated (uuid "gen-1") (type tuning_pattern) (members "s-1"))"#;
+    let group = r#"(group "" (uuid "g-t") (members "s-1" "gen-1"))"#;
+    let (plan, before) = Plan::of(
+        Path::new("b.kicad_pcb"),
+        &board_text(&[SEGMENT_GND, generated, group]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        before.linked,
+        BTreeMap::from([("generated", 1), ("groups_of_routing_only", 1)])
+    );
+    // KiCad removes the track, its tuning pattern and the group that held only them.
+    let after = BoardReading::of(&board_text(&[])).unwrap();
+    assert!(compare(&plan, &before, &after).is_ok());
+}
+
+#[test]
 fn a_group_of_routing_only_is_linked_before_and_after_the_delete() {
     let group = r#"(group "" (uuid "g-r") (members "s-1"))"#;
     let (plan, before) = Plan::of(
