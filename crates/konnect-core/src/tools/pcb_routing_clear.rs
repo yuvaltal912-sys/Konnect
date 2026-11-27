@@ -5,8 +5,10 @@
 //! text `export_specctra_dsn` reads, so "locked" means here exactly what the export
 //! accepts as fixed wiring: `(locked yes)`. Only top-level `segment`, `arc` and `via`
 //! items are routing; an `(arc …)` inside a zone or polygon outline is geometry, not a
-//! track. Zones (teardrops included), footprints, graphics and everything else are
-//! never sent to KiCad for deletion, and the read-back proves they are unchanged.
+//! track. Zones, footprints, graphics and everything else are never sent to KiCad for
+//! deletion, and the read-back proves they are unchanged, apart from what KiCad itself
+//! updates with the tracks it belongs to (teardrop zones, tuning patterns, groups of
+//! routing only), which is counted before and after and reported.
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -33,9 +35,12 @@ pub(super) fn tools() -> Vec<ToolDef> {
          net and layer, what is kept, and returns plan_revision. The apply \
          (dry_run=false) needs that expected_plan_revision and refuses when the board \
          changed in any way since the preview. Locked tracks, arcs and vias are kept \
-         unless include_locked is true. Zones (teardrops included), footprints, graphics \
-         and text are never deleted; the apply reads the board back and reports what was \
-         removed, what was kept, and any other object that changed. The board is not \
+         unless include_locked is true. Only tracks, arcs and vias are sent to KiCad for \
+         deletion: zones, footprints, graphics and text never are, but KiCad itself may \
+         remove the teardrop zones, tuning patterns and routing-only groups that belong \
+         to deleted tracks (counted in linked_objects). The apply reads the board back \
+         and reports what was removed, what was kept, what KiCad updated, and any other \
+         object that changed. The board is not \
          saved: call save_project before an export. One Ctrl+Z in KiCad undoes the whole \
          delete. Live KiCad only, never a file edit.",
         json!({
@@ -84,12 +89,14 @@ pub(crate) struct RoutingItem {
     pub net: String,
     /// A track's or arc's layer; a via's span, its two outer layers joined by `-`.
     pub layer: String,
-    /// `(locked yes)`, as the Specctra export reads it.
+    /// `(locked yes)`, or a bare `locked` atom in an older file. The Specctra export
+    /// reads only the first; [`Self::export_refusal`] names the second.
     pub locked: bool,
     /// A member of a locked group, directly or through nested groups. KiCad treats it as
     /// locked; the text marks only the group, so the Specctra export reads it as unlocked.
     pub in_locked_group: bool,
-    /// Why `export_specctra_dsn` would refuse this item even when it is locked.
+    /// Why `export_specctra_dsn` would refuse this item even when it is locked (read only
+    /// for kept items).
     pub export_refusal: Option<&'static str>,
 }
 
@@ -209,25 +216,27 @@ impl BoardReading {
         let top = tree.children().unwrap_or(&[]).get(1..).unwrap_or(&[]);
         let groups: Vec<&SexpNode> = top.iter().filter(|n| n.head() == Some("group")).collect();
         let held = locked_group_members(&groups);
-        // What a group's members are compared without: routing, and identities that name
-        // nothing on the board (KiCad drops a deleted track from its group; an older
-        // file may still list it).
+        let linked_at = linked_objects(top);
+        // What a group's members are compared without: routing, linked objects, and
+        // identities that name nothing on the board (KiCad drops a deleted track from
+        // its group; an older file may still list it).
         let other_ids: BTreeSet<&str> = top
             .iter()
-            .filter(|n| n.head().and_then(Kind::of).is_none())
-            .filter_map(uuid_of)
+            .enumerate()
+            .filter(|(i, n)| n.head().and_then(Kind::of).is_none() && !linked_at.contains_key(i))
+            .filter_map(|(_, n)| uuid_of(n))
             .collect();
         let mut routing = Vec::new();
         let mut fixed = Vec::new();
         let mut linked = BTreeMap::new();
-        for node in top {
+        for (index, node) in top.iter().enumerate() {
             let Some(head) = node.head() else { continue };
             if let Some(kind) = Kind::of(head) {
                 routing.push(routing_item(node, kind, &net_names, &held));
             } else if head == "net" {
                 // The net table: renumbered by KiCad 9 as nets lose their last item.
-            } else if let Some(name) = linked_name(node, &other_ids) {
-                *linked.entry(name).or_insert(0) += 1;
+            } else if let Some(name) = linked_at.get(&index) {
+                *linked.entry(*name).or_insert(0) += 1;
             } else {
                 fixed.push(fingerprint(node, &net_names, &other_ids));
             }
@@ -241,15 +250,48 @@ impl BoardReading {
     }
 }
 
-/// The objects counted in [`BoardReading::linked`].
-fn linked_name(node: &SexpNode, other_ids: &BTreeSet<&str>) -> Option<&'static str> {
-    match node.head()? {
-        "zone" if crate::specctra::is_teardrop(node) => Some("teardrop_zones"),
-        "generated" => Some("generated"),
-        "group" if !members(node).iter().any(|m| other_ids.contains(m)) => {
-            Some("groups_of_routing_only")
+/// The top-level objects counted in [`BoardReading::linked`], by position: teardrop
+/// zones, generated objects, and groups whose members are all routing, linked objects
+/// or identities that name nothing (to a fixed point, so a group of such groups is
+/// linked too). An empty group is linked as well: it is what a group of routing only
+/// becomes after the delete.
+fn linked_objects(top: &[SexpNode]) -> BTreeMap<usize, &'static str> {
+    let routing_ids: BTreeSet<&str> = top
+        .iter()
+        .filter(|n| n.head().and_then(Kind::of).is_some())
+        .filter_map(uuid_of)
+        .collect();
+    let all_ids: BTreeSet<&str> = top.iter().filter_map(uuid_of).collect();
+    let mut linked: BTreeMap<usize, &'static str> = BTreeMap::new();
+    let mut linked_ids: BTreeSet<&str> = BTreeSet::new();
+    for (index, node) in top.iter().enumerate() {
+        let name = match node.head() {
+            Some("zone") if crate::specctra::is_teardrop(node) => "teardrop_zones",
+            Some("generated") => "generated",
+            _ => continue,
+        };
+        linked.insert(index, name);
+        linked_ids.extend(uuid_of(node));
+    }
+    loop {
+        let mut grew = false;
+        for (index, node) in top.iter().enumerate() {
+            if node.head() != Some("group") || linked.contains_key(&index) {
+                continue;
+            }
+            let list = members(node);
+            let tied = |m: &&str| routing_ids.contains(m) || linked_ids.contains(m);
+            // Empty or all-dangling counts too: a group whose routing KiCad removed is
+            // empty (or dangling) after the delete, and it was linked before.
+            if list.iter().all(|m| tied(m) || !all_ids.contains(m)) {
+                linked.insert(index, "groups_of_routing_only");
+                linked_ids.extend(uuid_of(node));
+                grew = true;
+            }
         }
-        _ => None,
+        if !grew {
+            return linked;
+        }
     }
 }
 
@@ -280,12 +322,37 @@ fn routing_item(
             .unwrap_or_default(),
         Kind::Track | Kind::Arc => node.find_str("layer").unwrap_or("").to_string(),
     };
-    // What the export refuses in locked wiring (`specctra::locked_routing`): arcs, vias
-    // with a type (blind, micro) or other than the through span, zero-length tracks.
+    // What the export refuses in locked wiring (`specctra::locked_routing`): a lock it
+    // does not read, no net, arcs, vias with a type (blind, micro), other than the
+    // through span, or a drill it cannot take, and zero-length tracks.
+    let size = node.find_f64("size");
+    let drill = node.find("drill");
+    let drill_mm = drill
+        .and_then(|d| d.get(1))
+        .and_then(SexpNode::as_str)
+        .and_then(|d| d.parse::<f64>().ok());
     let export_refusal = match kind {
+        _ if is_locked(node) && node.find_str("locked") != Some("yes") => {
+            Some("a lock written the old way (the export reads it as unlocked)")
+        }
+        _ if net.is_empty() => Some("a locked item with no net"),
         Kind::Arc => Some("a locked routed arc"),
         Kind::Via if node.find("type").is_some() => Some("a locked blind or micro via"),
         Kind::Via if layer != "F.Cu-B.Cu" => Some("a locked via that is not a through via"),
+        Kind::Via if drill.is_none() => Some("a locked via with no drill"),
+        Kind::Via
+            if drill.is_some_and(|d| {
+                d.children()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|c| c.as_str() == Some("oval"))
+            }) =>
+        {
+            Some("a locked via with an oval drill")
+        }
+        Kind::Via if matches!((drill_mm, size), (Some(d), Some(s)) if d >= s) => {
+            Some("a locked via whose drill is not smaller than its size")
+        }
         Kind::Track if point(node, "start") == point(node, "end") => {
             Some("a locked zero-length track")
         }
@@ -297,7 +364,7 @@ fn routing_item(
         uuid,
         net,
         layer,
-        locked: node.find_str("locked") == Some("yes"),
+        locked: is_locked(node),
         export_refusal,
     }
 }
@@ -482,7 +549,7 @@ fn kept_note(plan: &Plan) -> Value {
         }
     }
     let mut value = kept.json();
-    value["in_locked_groups"] = json!(grouped);
+    value["held_only_by_locked_groups"] = json!(grouped);
     value["why"] = json!(if plan.include_locked {
         "include_locked is true: locked routing, and routing in locked groups, is deleted too"
     } else {
@@ -656,7 +723,7 @@ fn run(client: &konnect_ipc::client::KiCadIpcClient, call: &Call) -> Result<Call
     if plan.delete.is_empty() {
         body["status"] = json!("noop");
         body["removed"] = Counts::default().json();
-        body["readback"] = json!("not_written");
+        body["readback"] = json!("nothing_to_delete");
         return Ok(CallToolResult::json(&body));
     }
     let ids = plan.ids();

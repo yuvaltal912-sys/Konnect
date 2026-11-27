@@ -636,7 +636,7 @@ async fn routing_in_a_locked_group_is_kept_and_flagged() {
     let (error, _, body) = h.call(json!({})).await;
     assert!(!error, "{body}");
     assert_eq!(body["will_delete"]["total"], 1, "{body}");
-    assert_eq!(body["kept_locked"]["in_locked_groups"], 1);
+    assert_eq!(body["kept_locked"]["held_only_by_locked_groups"], 1);
     assert_eq!(body["kept_locked"]["export_will_refuse"][0]["count"], 1);
     let revision = body["plan_revision"].as_str().unwrap().to_string();
     let (error, _, body) = h
@@ -751,4 +751,86 @@ fn a_read_that_times_out_before_the_commit_is_not_an_unknown_outcome() {
     // Any other error keeps its type.
     let other = before_commit(anyhow::Error::new(std::io::Error::other("x")));
     assert!(other.downcast_ref::<std::io::Error>().is_some());
+}
+
+#[test]
+fn a_nested_locked_group_holds_the_routing_of_its_inner_groups() {
+    let outer = r#"(group "outer" (uuid "g-o") (locked yes) (members "g-i"))"#;
+    let inner = r#"(group "inner" (uuid "g-i") (members "s-1"))"#;
+    let (plan, _) = Plan::of(
+        Path::new("b.kicad_pcb"),
+        &board_text(&[SEGMENT_GND, VIA_GND, outer, inner]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(plan.ids(), ["v-1"]);
+    assert!(plan.keep_locked[0].in_locked_group);
+}
+
+#[test]
+fn a_group_holding_a_tuning_pattern_is_not_a_false_alarm() {
+    const FOOTPRINT: &str = "11111111-1111-4111-8111-111111111111";
+    let generated = r#"(generated (uuid "gen-1") (type tuning_pattern) (members "s-1"))"#;
+    let outer = format!(r#"(group "g" (uuid "g-1") (members "gen-1" "{FOOTPRINT}"))"#);
+    let (plan, before) = Plan::of(
+        Path::new("b.kicad_pcb"),
+        &board_text(&[SEGMENT_GND, generated, &outer]),
+        false,
+    )
+    .unwrap();
+    // KiCad removes the tuning pattern with its track and drops it from the group.
+    let after_group = format!(r#"(group "g" (uuid "g-1") (members "{FOOTPRINT}"))"#);
+    let after = BoardReading::of(&board_text(&[&after_group])).unwrap();
+    let readback = compare(&plan, &before, &after).unwrap();
+    let field = |key: &str| readback.iter().find(|(k, _)| *k == key).unwrap().1.clone();
+    assert_eq!(
+        field("never_touched")["kicad_updated"],
+        json!(["KiCad removed 1 generated with their tracks"])
+    );
+}
+
+#[test]
+fn a_group_of_routing_only_is_linked_before_and_after_the_delete() {
+    let group = r#"(group "" (uuid "g-r") (members "s-1"))"#;
+    let (plan, before) = Plan::of(
+        Path::new("b.kicad_pcb"),
+        &board_text(&[SEGMENT_GND, group]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(before.linked.get("groups_of_routing_only"), Some(&1));
+    // KiCad empties the group, keeps it with a dangling member, or removes it.
+    for after in [
+        r#"(group "" (uuid "g-r") (members))"#,
+        r#"(group "" (uuid "g-r") (members "s-1"))"#,
+        "",
+    ] {
+        let items: Vec<&str> = [after].into_iter().filter(|a| !a.is_empty()).collect();
+        let after = BoardReading::of(&board_text(&items)).unwrap();
+        assert!(compare(&plan, &before, &after).is_ok());
+    }
+}
+
+#[test]
+fn kept_vias_the_export_cannot_take_and_unnetted_locks_are_named() {
+    let text = board_text(&[
+        r#"(via (at 1 1) (size 0.6) (layers "F.Cu" "B.Cu") (locked yes) (net "GND") (uuid "v-nodrill"))"#,
+        r#"(via (at 1 1) (size 0.6) (drill oval 0.3 0.4) (layers "F.Cu" "B.Cu") (locked yes) (net "GND") (uuid "v-oval"))"#,
+        r#"(via (at 1 1) (size 0.3) (drill 0.3) (layers "F.Cu" "B.Cu") (locked yes) (net "GND") (uuid "v-big"))"#,
+        r#"(segment (start 0 0) (end 1 0) (width 0.2) (locked yes) (layer "F.Cu") (uuid "s-nonet"))"#,
+        r#"(segment locked (start 0 0) (end 1 0) (width 0.2) (layer "F.Cu") (net "GND") (uuid "s-old"))"#,
+    ]);
+    let (plan, _) = Plan::of(Path::new("b.kicad_pcb"), &text, false).unwrap();
+    assert!(plan.delete.is_empty(), "an old-style lock is kept too");
+    let reasons: Vec<Option<&str>> = plan.keep_locked.iter().map(|i| i.export_refusal).collect();
+    assert_eq!(
+        reasons,
+        [
+            Some("a locked via with no drill"),
+            Some("a locked via with an oval drill"),
+            Some("a locked via whose drill is not smaller than its size"),
+            Some("a locked item with no net"),
+            Some("a lock written the old way (the export reads it as unlocked)"),
+        ]
+    );
 }
