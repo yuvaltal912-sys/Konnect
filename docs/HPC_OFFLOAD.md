@@ -2,7 +2,8 @@
 
 Status 2026-11-27: working. Real jobs ran on the cluster on 2026-11-27: 20894, 20895, 20896 and
 20898 on `hpc-node5`, then the mutants jobs 20899, 20915 and 20920 (one PR's batch, on
-`hpc-node5` and `hpc-node7`); the measured values below come from them. Their records are
+`hpc-node5` and `hpc-node7`) and 20921 (the shared-target fix); the measured values below come
+from them. Their records are
 in the main checkout's `target/hpc-runs/` (20896, the one-off `cargo-mutants` install, has no
 record folder; its times come from `sacct`). Values still
 marked *unmeasured* are not settled by those runs. `scripts/hpc/selftest.sh` also runs the
@@ -116,15 +117,17 @@ Measured on the cluster, 2026-11-27 (16 CPUs, 16 GB, `hpc-node5`, x86_64):
 | Queue wait | none: `sacct` gives the same submit and start time for all four jobs (one afternoon; a busy week may differ) |
 | `konnect-sexp` tests (`--lib`) | 168 s cold, including its build; 32 s warm. 227 passed, 2 ignored |
 | `konnect-core` cold build plus the `place_converge` tests | 245 s for the step, of which the tests took 77 s |
-| `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4` (job 20898, with the shared target) | 42 mutants in 6 minutes |
+| `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4`, before the fix (job 20898, shared target) | 42 mutants in 6 minutes: 19 caught, 22 unviable, 1 missed |
+| The same, `mutants-probe.plan` as committed, through the fix (job 20921, `hpc-node5`) | 42 mutants in 5 minutes: 40 caught, 1 unviable, 1 missed |
 | One PR's mutants batch: `konnect-core/src/tools/netclass_live.rs`, `--jobs 6` on 32 CPUs (job 20920, `hpc-node7`) | 81 mutants in 19.6 minutes: 75 caught, 3 missed, 3 unviable. The Mac's run of the same batch: 22 minutes, the same 3 missed |
 | `target/` after those runs | 2.3 GB (`du`, read over ssh after job 20898) |
 | Disk | the home folder is on a shared 166 TB file system with 112 TB free; `quota` reports no user quota. The node's `/tmp` has 59 GB free |
 | Network from the compute node | reaches crates.io |
 
 *Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, the queue at busy times,
-other `--jobs` values, and the two example plans exactly as committed (`first-probe.plan` with its
-`--skip`, `mutants-probe.plan` with its last check).
+other `--jobs` values, and `first-probe.plan` exactly as committed (with its `--skip`). The
+wrapper's reading of option values (`--manifest-path PATH mutants` and the like) is checked on
+the fake cluster only; on the cluster it ran for plain `cargo mutants` (job 20921).
 
 The gain: one mutants batch on the cluster is about as fast as on the Mac (19.6 against 22
 minutes for the same 81 mutants), so the gain is not speed. It is the second lane: the batch
@@ -237,14 +240,20 @@ every mutant read unviable: job 20899 read 81 of 81 unviable on one PR's batch a
 `--jobs 1` worked with and without the shared target (job 20915: 3 of 3 caught both ways), and
 `env -u CARGO_TARGET_DIR` at `--jobs 6` gave the Mac's result (job 20920, in the table above).
 So `run-plan.sh` puts two wrappers first on `PATH`: one for `cargo` that unsets the variable when
-the subcommand (the first word that is not an option or a `+toolchain`) is `mutants`, and one
-for `cargo-mutants`. A plan author needs no `env -u`, and a step's log says
+the subcommand is `mutants`, and one for `cargo-mutants`. The subcommand is the first word that
+is not an option, a `+toolchain` or the value of an option that takes one (`--manifest-path`,
+`--config`, `-Z`, `-C`, `--color`, `--target-dir`, `--explain`), so `cargo test mutants` and
+`cargo run -- mutants` keep the shared target. The job stops before any step if `cargo` on `PATH`
+is already a wrapper, which would call itself. A plan author needs no `env -u`, and a step's log says
 `hpc: cargo mutants runs without the shared CARGO_TARGET_DIR`. Every other cargo command keeps
 the shared target, the warm cache, even in the same step. Each mutants copy builds cold, so a
-batch spends a few minutes on the baseline build (180 s for `konnect-core`).
+batch spends time on the baseline build: 180 s for `konnect-core` (job 20899's log), 19 s for
+`konnect-sexp` (job 20921's).
 
-The net.rs probe (job 20898, `--jobs 4`, 16 CPUs) ran before that fix: 19 caught, 22 unviable,
-1 missed. Some of its 22 unviable may come from the shared target. The missed mutant
+The net.rs probe shows the fix on the cluster. Before it (job 20898, `--jobs 4`, 16 CPUs): 19
+caught, 22 unviable, 1 missed. Through the wrappers, the same 42 mutants (job 20921,
+`mutants-probe.plan` as committed): 40 caught, 1 unviable, 1 missed, and the step's log carries
+the wrapper's line. So 21 of the 22 unviable came from the shared target. The missed mutant
 (`names_nets_in_place` in `konnect-sexp/src/net.rs` replaced with `true`) is a gap that is already
 on `main`, not something these scripts caused.
 

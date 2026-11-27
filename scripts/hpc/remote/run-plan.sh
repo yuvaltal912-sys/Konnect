@@ -52,15 +52,22 @@ rustc -V | grep -q "^rustc $want " || { echo "toolchain is not $want" >>"$OUT/en
 # unviable (job 20899: 81 of 81); without it each copy builds in its own target (job 20920).
 # Ordinary steps keep the shared target, the warm cache. Wrappers early on PATH unset it for a
 # `cargo [+toolchain] [options] mutants ...` or `cargo-mutants ...` process, whatever the step's
-# command looks like, and say so in the step's log.
+# command looks like, and say so in the step's log. The cargo wrapper reads the subcommand as
+# cargo does: the first word that is not an option, a `+toolchain` or the value of an option
+# that takes one (`--manifest-path PATH`, `--config KV`, `-Z FLAG`, `-C DIR`, `--color WHEN`).
 SHIM="$RUN/scratch/bin"
 mkdir -p "$SHIM"
-real_cargo=$(command -v cargo)
+real_cargo=$(command -v cargo || true)
 real_mutants=$(command -v cargo-mutants || true)
+case "$real_cargo" in '' | "$SHIM"/*) echo "no real cargo on PATH (found '$real_cargo')" >>"$OUT/env.txt"; exit 4 ;; esac
+case "$real_mutants" in "$SHIM"/*) echo "cargo-mutants on PATH is the wrapper" >>"$OUT/env.txt"; exit 4 ;; esac
 cat >"$SHIM/cargo" <<EOF
 #!/bin/bash
+value=0
 for a in "\$@"; do
+    if [ "\$value" = 1 ]; then value=0; continue; fi
     case "\$a" in
+        --manifest-path | --config | -Z | -C | --color | --target-dir | --explain) value=1 ;;
         +* | -*) ;;
         mutants) [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
                  unset CARGO_TARGET_DIR; break ;;

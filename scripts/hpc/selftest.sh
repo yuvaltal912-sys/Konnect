@@ -60,14 +60,10 @@ cat >"$F/bin/cargo" <<'EOF'
 case "$1" in
     fetch) ;;
     -V) echo "cargo 1.96.0 (fake)" ;;
-    *) case " $* " in
-        *" mutants "*) echo "fake mutants target=${CARGO_TARGET_DIR:-unset}" ;;
-        *" test "*) echo "fake test target=${CARGO_TARGET_DIR:-unset}" ;;
-        *) exit 1 ;;
-       esac ;;
+    *) echo "fake target=${CARGO_TARGET_DIR:-unset}" ;;
 esac
 EOF
-printf '#!/bin/bash\necho "fake mutants target=${CARGO_TARGET_DIR:-unset}"\n' >"$F/bin/cargo-mutants"
+printf '#!/bin/bash\necho "fake target=${CARGO_TARGET_DIR:-unset}"\n' >"$F/bin/cargo-mutants"
 # curl serves a fake protoc release zip and logs each download; nothing leaves the machine.
 cat >"$F/bin/curl" <<EOF
 #!/bin/bash
@@ -163,17 +159,21 @@ check "fetch: dirty record-only step" 0 "dirtyprobe .* recorded(exit 3)+DIRTY " 
 check "fetch: odd record noted"   0 "NOTE: record-only steps that exited non-zero: probe" "$fetch"
 # cargo mutants never sees the shared CARGO_TARGET_DIR; ordinary cargo steps keep it.
 cat >"$F/plan/target.plan" <<'EOF'
-pass tgt-mutants    cargo mutants --jobs 2 --timeout 60 2>/dev/null | grep -qx "fake mutants target=unset"
-pass tgt-toolchain  cargo +1.96.0 --locked mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
-pass tgt-direct     cargo-mutants mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
-pass tgt-explicit   CARGO_TARGET_DIR=/tmp/elsewhere cargo mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
-pass tgt-test       cargo test -p x 2>/dev/null | grep -qx "fake test target=$(cd ../ && pwd)/target"
-pass tgt-after      cargo mutants >/dev/null 2>&1; cargo test | grep -q "target=/.*/target$"
-pass tgt-note       cargo mutants 2>&1 >/dev/null | grep -qx "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR"
-pass tgt-arg        cargo test -p mutants-helper 2>/dev/null | grep -q "fake test target=/"
+pass m-plain       cargo mutants --jobs 2 --timeout 60 2>/dev/null | grep -qx "fake target=unset"
+pass m-toolchain   cargo +1.96.0 --locked mutants --jobs 2 2>/dev/null | grep -qx "fake target=unset"
+pass m-direct      cargo-mutants mutants --jobs 2 2>/dev/null | grep -qx "fake target=unset"
+pass m-explicit    CARGO_TARGET_DIR=/tmp/elsewhere cargo mutants --jobs 2 2>/dev/null | grep -qx "fake target=unset"
+pass m-manifest    cargo --manifest-path a/Cargo.toml mutants --jobs 2 2>/dev/null | grep -qx "fake target=unset"
+pass m-color       cargo --color never -Z x -C . --config k=v mutants 2>/dev/null | grep -qx "fake target=unset"
+pass m-note        cargo mutants 2>&1 >/dev/null | grep -qx "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR"
+pass s-test        cargo test -p x 2>/dev/null | grep -qx "fake target=$(cd ../ && pwd)/target"
+pass s-test-filter cargo test mutants 2>/dev/null | grep -qx "fake target=$(cd ../ && pwd)/target"
+pass s-run-arg     cargo run -- mutants 2>/dev/null | grep -qx "fake target=$(cd ../ && pwd)/target"
+pass s-value       cargo --manifest-path mutants test 2>/dev/null | grep -qx "fake target=$(cd ../ && pwd)/target"
+pass s-no-note     cargo test 2>&1 >/dev/null | wc -c | grep -qx " *0"
 EOF
 check "mutants target plan" 0 "submitted" "$sub" "$F/plan/target.plan"
-check "mutants: own targets, other steps shared" 0 "ALL STEPS AS EXPECTED (8 steps)" "$fetch"
+check "mutants: own targets, other steps shared" 0 "ALL STEPS AS EXPECTED (12 steps)" "$fetch"
 
 printf 'pass a true\nfail:ctl/break.patch c echo other\n' >"$F/plan/nobase.plan"
 check "control without baseline refused" 1 "has no baseline" "$sub" "$F/plan/nobase.plan" --dry-run
@@ -236,6 +236,13 @@ check "job refused before any step reads INCOMPLETE" 0 "INCOMPLETE: 0 of 1" "$fe
 nostart=$(basename "$(dirname "$(ls -1t "$F/runs"/*/jobid | head -n 1)")")
 rm -rf "${F:?}/remote/runs/$nostart/out" # as if apptainer itself had failed
 check "never-started plan reads INCOMPLETE" 0 "INCOMPLETE: the plan never started" "$fetch" "$nostart"
+cp "$F/env.kept" "$F/home/.cargo/env"
+# The job refuses when `cargo` on PATH is already the wrapper (it would exec itself forever).
+printf '%s\n' "if [ -n \"\${SLURM_JOB_ID:-}\" ]; then mkdir -p \"\$RUN/scratch/bin\"; printf '#!/bin/bash\\n' >\"\$RUN/scratch/bin/cargo\"; chmod +x \"\$RUN/scratch/bin/cargo\"; export PATH=\"\$RUN/scratch/bin:$F/bin:\$PATH\"; else export PATH=\"$F/bin:\$PATH\"; fi" >"$F/home/.cargo/env"
+check "job refuses a wrapper as the real cargo" 0 "submitted" "$sub" --cmd true
+check "wrapper as cargo: no step ran" 0 "INCOMPLETE: 0 of 1" "$fetch"
+selfrun=$(basename "$(dirname "$(ls -1t "$F/runs"/*/jobid | head -n 1)")")
+grep -q "no real cargo on PATH" "$F/runs/$selfrun/remote/out/env.txt" && { ok=$((ok + 1)); echo "ok    wrapper as cargo: reason in env.txt"; } || { bad=$((bad + 1)); echo "FAIL  wrapper as cargo: no reason in env.txt"; }
 cp "$F/env.kept" "$F/home/.cargo/env"
 
 echo "31000 other RUNNING" >"$F/state/queue"
