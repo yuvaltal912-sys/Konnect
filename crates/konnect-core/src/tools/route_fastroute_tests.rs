@@ -1834,6 +1834,10 @@ fn a_finished_search_reports_the_pairs_in_either_ending() {
         "USB_DN"
     );
     assert!(!call.ses_output.exists());
+    // The result without a winner says what was and was not checked, as the other.
+    assert_eq!(found["summary"]["lengths"]["checked"], false, "{found:#}");
+    assert_eq!(found["summary"]["pours"]["tried"], true);
+    assert!(found["summary"]["pours"]["winner_shape"].is_null());
     // Control: without pairs both endings carry empty lists.
     for winner in [true, false] {
         let (result, _call, _root) = ended(winner, &PairsPlan::default());
@@ -4528,7 +4532,7 @@ fn the_summary_says_how_the_pours_were_given_to_the_router() {
     let mut search = finished_search();
     // Run 1 (omitted) fails a gate, so the counts tell the shapes apart.
     search.outcome.runs[1].judged.as_mut().unwrap().gates.g2 = vec!["clearance".to_string()];
-    let both = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome);
+    let both = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false);
     assert_eq!(both["tried"], true);
     assert_eq!(both["winner_shape"], "as_exported");
     assert_eq!(
@@ -4544,15 +4548,15 @@ fn the_summary_says_how_the_pours_were_given_to_the_router() {
 
     // The omitted run wins: the line says the router never saw the pours.
     search.outcome.winner = Some(1);
-    let omitted = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome);
+    let omitted = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false);
     assert_eq!(omitted["winner_shape"], "omitted");
     assert!(omitted["line"]
         .as_str()
         .unwrap()
-        .contains("the router never saw them"));
+        .contains("The router never saw them"));
 
     // A DSN without a plane: nothing tried, and the step that adds pours.
-    let none = pours_summary(&[Shape::AsExported], &search.outcome);
+    let none = pours_summary(&[Shape::AsExported], &search.outcome, false);
     assert_eq!(none["tried"], false);
     let line = none["line"].as_str().unwrap();
     assert!(
@@ -4564,7 +4568,7 @@ fn the_summary_says_how_the_pours_were_given_to_the_router() {
     // No winner: said, and the result without a winner carries the summary too.
     search.outcome.winner = None;
     assert!(
-        pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome)["line"]
+        pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false)["line"]
             .as_str()
             .unwrap()
             .ends_with("No run won.")
@@ -4573,4 +4577,114 @@ fn the_summary_says_how_the_pours_were_given_to_the_router() {
     assert_eq!(failed["success"], false);
     assert_eq!(failed["summary"]["pours"]["tried"], true);
     assert_eq!(failed["summary"]["lengths"]["checked"], false);
+}
+
+/// Pours the export left out: one shape, and the line says the board has them and
+/// what fills them, never to add them again. A winner on the omitted shape gets the
+/// same refill sentence; a winner that was not judged is no winner.
+#[test]
+fn the_pour_summary_tells_pours_left_out_at_export_from_no_pours() {
+    let mut search = finished_search();
+    let omitted = pours_summary(&[Shape::AsExported], &search.outcome, true);
+    assert_eq!(omitted["tried"], false);
+    assert_eq!(omitted["omitted_at_export"], true);
+    let line = omitted["line"].as_str().unwrap();
+    assert!(line.starts_with("Pours: left out at the export"), "{line}");
+    assert!(
+        line.contains("refill_zones") && !line.contains("add_zone"),
+        "{line}"
+    );
+    // The negative control: the same search without the manifest's flag.
+    let none = pours_summary(&[Shape::AsExported], &search.outcome, false);
+    assert!(none["line"].as_str().unwrap().contains("add_zone"));
+
+    // The omitted shape wins: the refill sentence; the planes win: none.
+    search.outcome.winner = Some(1);
+    let won = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false);
+    assert!(won["line"].as_str().unwrap().contains("does not fill them"));
+    search.outcome.winner = Some(0);
+    let planes = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false);
+    assert!(!planes["line"]
+        .as_str()
+        .unwrap()
+        .contains("does not fill them"));
+
+    // A winner index on a run that was not judged (run 2 failed to route).
+    search.outcome.winner = Some(2);
+    let unjudged = pours_summary(&[Shape::AsExported, Shape::Omitted], &search.outcome, false);
+    assert!(unjudged["winner_shape"].is_null());
+    assert!(unjudged["line"].as_str().unwrap().ends_with("No run won."));
+}
+
+/// The manifest's `pours_omitted` reaches the summary.
+#[test]
+fn the_summary_reads_the_export_flag_from_the_manifest() {
+    let search = finished_search();
+    std::fs::write(
+        search.root.join("board.dsn.konnect.json"),
+        json!({ "supported_profile": { "pours_omitted": true } }).to_string(),
+    )
+    .unwrap();
+    let body = summary_json(
+        &search.root.join("board.dsn"),
+        &[Shape::AsExported],
+        &search.outcome,
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+        Some(true),
+    );
+    assert_eq!(body["pours"]["omitted_at_export"], true);
+    std::fs::remove_file(search.root.join("board.dsn.konnect.json")).unwrap();
+    let body = summary_json(
+        &search.root.join("board.dsn"),
+        &[Shape::AsExported],
+        &search.outcome,
+        &PairsPlan::default(),
+        &LengthPlan::default(),
+        Some(true),
+    );
+    assert_eq!(body["pours"]["omitted_at_export"], false);
+}
+
+/// An intent pair named without its sheet path, resolved to `/CAN_H` and `/CAN_L`,
+/// is not suggested again, and neither is one the DSN names that way.
+#[test]
+fn a_declared_pair_on_a_sub_sheet_is_not_suggested_again() {
+    let search = finished_search();
+    let board = search.root.join("real.kicad_pcb");
+    std::fs::write(
+        &board,
+        r#"(kicad_pcb (net 0 "") (net 1 "/can/CAN_H") (net 2 "/can/CAN_L") (net 3 "/TX+") (net 4 "/TX-"))"#,
+    )
+    .unwrap();
+    let manifest = json!({ "board_path": board });
+    let by_name = PairsPlan {
+        unresolved: vec![UnresolvedPair {
+            positive: "CAN_H".to_string(),
+            negative: "CAN_L".to_string(),
+            reason: "r".to_string(),
+        }],
+        ..PairsPlan::default()
+    };
+    let names = |pairs: &PairsPlan| -> Vec<String> {
+        board_likely_pairs(Some(&manifest), pairs)
+            .into_iter()
+            .map(|pair| pair.positive)
+            .collect()
+    };
+    assert_eq!(names(&by_name), ["/TX+"]);
+    let by_dsn = PairsPlan {
+        resolved: vec![ResolvedPair {
+            positive: "X".to_string(),
+            negative: "Y".to_string(),
+            dsn_positive: "/can/CAN_H".to_string(),
+            dsn_negative: "/can/CAN_L".to_string(),
+            gap_mm: None,
+            max_skew_mm: None,
+        }],
+        ..PairsPlan::default()
+    };
+    assert_eq!(names(&by_dsn), ["/TX+"]);
+    // The negative control: no declared pair, both are suggested.
+    assert_eq!(names(&PairsPlan::default()), ["/TX+", "/can/CAN_H"]);
 }

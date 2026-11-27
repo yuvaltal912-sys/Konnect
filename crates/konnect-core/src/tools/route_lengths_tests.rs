@@ -2808,7 +2808,7 @@ fn a_plan_that_checks_nothing_says_so_and_lists_the_likely_pairs() {
     assert!(noted.summary_json(None, &[])["line"]
         .as_str()
         .unwrap()
-        .contains("Also: the design intent x cannot be used (bad)."));
+        .contains("The design intent was not read: the design intent x cannot be used (bad)."));
 }
 
 #[test]
@@ -2847,7 +2847,65 @@ fn a_plan_with_a_group_or_only_kicad_rules_is_checked() {
 #[test]
 fn a_net_is_in_one_suggested_pair_at_most() {
     // Two spellings of one half both find the same partner: one pair only.
-    let pairs = likely_pairs(&set(&["/S_H", "/s_h", "/S_L"]), &BTreeSet::new());
+    let pairs = likely_pairs(&set(&["/CAN_H", "/can_h", "/CAN_L"]), &BTreeSet::new());
     assert_eq!(pairs.len(), 1, "{pairs:?}");
-    assert_eq!(pairs[0].negative, "/S_L");
+    assert_eq!(pairs[0].negative, "/CAN_L");
+}
+
+#[test]
+fn high_low_pairs_count_only_on_can_and_terminal_pairs_never() {
+    let nets = set(&[
+        "PWM_H",
+        "PWM_L",
+        "/GATE_A_H",
+        "/GATE_A_L",
+        "BAT+",
+        "BAT-",
+        "VREF+",
+        "VREF-",
+        "LED+",
+        "LED-",
+        "/can2/CAN2_H",
+        "/can2/CAN2_L",
+    ]);
+    assert_eq!(
+        pair_names(&likely_pairs(&nets, &BTreeSet::new())),
+        [("/can2/CAN2_H", "/can2/CAN2_L", "_H/_L")]
+    );
+}
+
+#[test]
+fn the_not_checked_line_names_what_could_not_be_read() {
+    let line = |plan: &LengthPlan| {
+        plan.summary_json(None, &[])["line"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let plain = line(&LengthPlan::default());
+    assert!(plain.contains("declares no length group") && plain.contains("no length or skew rule"));
+    let unreadable = line(&LengthPlan {
+        kicad_rules_note: Some("the rules file x could not be listed (bad)".to_string()),
+        ..LengthPlan::default()
+    });
+    assert!(
+        unreadable.contains("could not be listed: the rules file x"),
+        "{unreadable}"
+    );
+    assert!(
+        !unreadable.contains("no length or skew rule"),
+        "{unreadable}"
+    );
+    let no_intent = line(&LengthPlan {
+        note: Some("the design intent x cannot be used (bad)".to_string()),
+        ..LengthPlan::default()
+    });
+    assert!(
+        no_intent.contains("was not read: the design intent x"),
+        "{no_intent}"
+    );
+    assert!(
+        !no_intent.contains("declares no length group"),
+        "{no_intent}"
+    );
 }

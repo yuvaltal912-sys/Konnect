@@ -812,8 +812,8 @@ impl Change {
 
 /// The parts `placements` moves or turns against `model`'s parts, the largest move
 /// first (then by reference). A placement equal to the part's own position (within
-/// 1e-6 mm and 1e-6 degrees) is no move; a reference the model lacks is listed as
-/// moved by 0 with its turn unknown (0).
+/// 1e-6 mm and 1e-6 degrees) is no move. A reference the model lacks is left out:
+/// the winner's placements are rebuilt from the same model, so there is none.
 pub(crate) fn moves_of(model: &BoardModel, placements: &[IpcFootprintPlacement]) -> Vec<PartMove> {
     let mut moves: Vec<PartMove> = placements
         .iter()
@@ -828,7 +828,7 @@ pub(crate) fn moves_of(model: &BoardModel, placements: &[IpcFootprintPlacement])
             if turn > 180.0 {
                 turn -= 360.0;
             }
-            if turn.abs() < 1e-6 || (360.0 - turn.abs()).abs() < 1e-6 {
+            if turn.abs() < 1e-6 {
                 turn = 0.0;
             }
             let distance = dx.hypot(dy);

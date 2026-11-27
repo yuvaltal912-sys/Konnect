@@ -671,8 +671,9 @@ fn the_moves_list_only_parts_that_move_or_turn_largest_first() {
         nudged(&model, "R1", 0.25, 0.0),
         nudged(&model, "R2", -2.0, 0.0),
         nudged(&model, "R3", 0.0, 90.0),
-        // A full turn is no turn.
+        // A full turn is no turn, and float noise below a full turn is none either.
         nudged(&model, "R4", 0.0, 360.0),
+        nudged(&model, "R5", 0.0, -1e-9),
     ];
     let moves = moves_of(&model, &placements);
     let names: Vec<&str> = moves.iter().map(|m| m.reference.as_str()).collect();

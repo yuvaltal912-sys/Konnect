@@ -426,15 +426,20 @@ because KiCad checks one `skew` rule for a net; the pair keeps its own `skew`
 rule. `engine: 'freerouting'` tunes nothing and says so in
 `length_matching_note`.
 
-Read the fastroute result's `summary` before reporting it. `summary.lengths.line`
-says whether lengths were checked at all: a call whose intent declares no group
-or pair skew, on a board without length or skew rules, checks none, `status` then
-does not cover lengths, and `completion.not_checked` lists `lengths`. Say so to the
-user; when `summary.lengths.likely_pairs` lists nets named as pairs (CAN_H and
-CAN_L, TX+ and TX-), show them and record the ones the user confirms before
-routing again. `summary.pours.line` says how the pours reached the router: none
-(the DSN has no plane, so add pours before the export), or both ways with each
-way's judged and passing runs and the way the winner took.
+Read the fastroute result's `summary` before you report it.
+
+- `summary.lengths.line` says whether lengths were checked at all. Without a
+  group or pair skew in the intent, and without length or skew rules on the
+  board, nothing is checked. `status` then does not cover lengths, and
+  `completion.not_checked` lists `lengths`. Tell the user.
+- `summary.lengths.likely_pairs` lists nets whose names read as pairs (CAN_H and
+  CAN_L, TX+ and TX-). Show them. Record the ones the user confirms, then route
+  again.
+- `summary.pours.line` says how the pours reached the router. It names one of
+  three cases: no pour at all (add pours before the export), pours left out at
+  the export, or both ways tried, with each way's judged and passing runs and the
+  way the winner took. Pours the router did not see are filled by the refill step
+  in `completion.next_steps`, not by `apply_specctra_ses`.
 
 ### Freerouting round trip
 

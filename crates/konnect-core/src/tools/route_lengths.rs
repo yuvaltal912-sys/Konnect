@@ -1367,14 +1367,15 @@ pub(crate) struct LikelyPair {
 
 /// The name endings that make a pair, positive then negative, compared without
 /// case, with what a base before them must hold (`None`: anything but nothing).
-/// `+/-` covers D+/D- and TX+/TX-; `_H/_L` and `H/L` after CAN cover CAN; `_A/_B`
-/// only on a name with 485 in it (RS-485), as A and B elsewhere are often two
-/// separate signals (encoder phases).
+/// `+/-` covers D+/D- and TX+/TX-. `_H/_L` and `H/L` count only on a CAN name, as
+/// high and low elsewhere are often two signals (a half bridge's gate drives).
+/// `_A/_B` counts only on a name with 485 in it (RS-485), as A and B elsewhere are
+/// often two signals (encoder phases).
 const PAIR_ENDINGS: &[(&str, &str, Option<&str>)] = &[
     ("+", "-", None),
     ("_P", "_N", None),
     ("_DP", "_DM", None),
-    ("_H", "_L", None),
+    ("_H", "_L", Some("CAN")),
     ("H", "L", Some("CAN")),
     ("_A", "_B", Some("485")),
 ];
@@ -1434,13 +1435,30 @@ fn last_segment(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// A base a `+`/`-` pair of rails ends with: `V+`/`V-`, `VS-`, `VEE` and the like.
+/// A name of a supply or a terminal pair, not a signal pair, once its `+`/`-` is
+/// cut off: `V+`/`V-`, `VS-`, `BAT+`, `VREF-`, `LED+` and the like.
 fn is_rail_base(name: &str) -> bool {
     let upper = name.to_uppercase();
     let base = upper.trim_end_matches(['+', '-']);
     matches!(
         base,
-        "V" | "VS" | "VEE" | "VSS" | "VCC" | "VDD" | "VA" | "VD"
+        "V" | "VS"
+            | "VEE"
+            | "VSS"
+            | "VCC"
+            | "VDD"
+            | "VA"
+            | "VD"
+            | "BAT"
+            | "VBAT"
+            | "VREF"
+            | "REF"
+            | "LED"
+            | "PWR"
+            | "VIN"
+            | "VOUT"
+            | "AC"
+            | "DC"
     )
 }
 
@@ -1469,9 +1487,18 @@ impl LengthPlan {
     /// listed with the step that would check them.
     pub(crate) fn summary_json(&self, g4_pass: Option<bool>, likely: &[LikelyPair]) -> Value {
         if !self.checked() {
-            let mut line = "Lengths: not checked. The design intent declares no length group or pair skew (length_groups, max_skew_mm), and the board has no length or skew rule in a .kicad_dru, so nothing measured or matched any length; `status` does not cover lengths.".to_string();
-            if let Some(note) = &self.note {
-                line.push_str(&format!(" Also: {note}."));
+            let mut line = "Lengths: not checked. `status` does not cover lengths.".to_string();
+            match &self.note {
+                Some(note) => line.push_str(&format!(" The design intent was not read: {note}.")),
+                None => line.push_str(
+                    " The design intent declares no length group and no pair skew (length_groups, max_skew_mm).",
+                ),
+            }
+            match &self.kicad_rules_note {
+                Some(note) => line.push_str(&format!(
+                    " The board's length and skew rules could not be listed: {note}."
+                )),
+                None => line.push_str(" The board has no length or skew rule in a .kicad_dru."),
             }
             let mut body = json!({ "checked": false, "line": line });
             if !likely.is_empty() {

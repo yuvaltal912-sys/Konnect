@@ -981,7 +981,7 @@ fn zone_plan_file(
 /// that the judge runs no probe and G4 has no intent lines (L18). A board with such
 /// rules always gets checks (its `board_rules` flag), even with no group or pair.
 fn judge_checks(plan: &LengthPlan) -> Option<Arc<crate::length_probe::LengthChecks>> {
-    (!plan.is_empty() || !plan.kicad_rules.is_empty()).then(|| Arc::new(plan.checks()))
+    plan.checked().then(|| Arc::new(plan.checks()))
 }
 
 /// The `--layer-heights` value of the routing passes (L7): only when the call has a
@@ -1047,13 +1047,9 @@ pub(crate) fn conclude(
     else {
         let mut search = search_json(plan, shapes, outcome, Listing::Best);
         settings(&mut search);
-        return Ok(no_winner_result(
-            call,
-            outcome,
-            search,
-            pairs_plan,
-            lengths_plan,
-        ));
+        let result = no_winner_result(call, outcome, search, pairs_plan, lengths_plan);
+        let summary = summary_json(&call.dsn, shapes, outcome, pairs_plan, lengths_plan, None);
+        return Ok(with_fields(result, vec![("summary", summary)]));
     };
     let routed = winner.routed.as_ref().expect("filtered above");
     let session = std::fs::read_to_string(&routed.held.ses).map_err(|error| {
@@ -2292,6 +2288,10 @@ pub(crate) fn result_json(
     result
 }
 
+/// What fills pours the router did not see: `apply_specctra_ses` requests no
+/// refill, the DRC step of `completion.next_steps` does.
+const REFILL_AFTER_IMPORT: &str = "apply_specctra_ses does not fill them: the run_drc step with refill_zones in `completion.next_steps` does.";
+
 /// The result's `summary`: one plain line each on lengths
 /// ([`LengthPlan::summary_json`]) and pours ([`pours_summary`]), so that a reader
 /// sees what `status` covers and what it does not. `g4_pass` is the winner's G4
@@ -2304,26 +2304,32 @@ pub(crate) fn summary_json(
     lengths: &LengthPlan,
     g4_pass: Option<bool>,
 ) -> Value {
+    let manifest = crate::specctra::manifest_beside(dsn);
     let likely = if lengths.checked() {
         Vec::new()
     } else {
-        board_likely_pairs(dsn, pairs)
+        board_likely_pairs(manifest.as_ref(), pairs)
     };
+    let omitted_at_export = manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest["supported_profile"]["pours_omitted"] == true);
     json!({
         "lengths": lengths.summary_json(g4_pass, &likely),
-        "pours": pours_summary(shapes, outcome),
+        "pours": pours_summary(shapes, outcome, omitted_at_export),
     })
 }
 
-/// [`route_lengths::likely_pairs`] of the board the DSN was exported from (its
+/// [`route_lengths::likely_pairs`] of the board the DSN was exported from (the
 /// manifest's `board_path`), leaving out the nets of the intent's pairs; empty when
-/// the board cannot be found or read.
+/// the board cannot be found or read. An intent name stands for the board net of
+/// that name or the nets ending with `/` and that name (`route_pairs::resolve_name`),
+/// and a resolved pair's DSN names count too.
 fn board_likely_pairs(
-    dsn: &Path,
+    manifest: Option<&Value>,
     pairs: &route_pairs::PairsPlan,
 ) -> Vec<route_lengths::LikelyPair> {
-    let Some(board) = crate::specctra::manifest_beside(dsn)
-        .and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from))
+    let Some(board) =
+        manifest.and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from))
     else {
         return Vec::new();
     };
@@ -2333,32 +2339,54 @@ fn board_likely_pairs(
     else {
         return Vec::new();
     };
-    let declared: std::collections::BTreeSet<String> = pairs
+    let names: Vec<&String> = pairs
         .resolved
         .iter()
-        .flat_map(|pair| [pair.positive.clone(), pair.negative.clone()])
+        .flat_map(|pair| {
+            [
+                &pair.positive,
+                &pair.negative,
+                &pair.dsn_positive,
+                &pair.dsn_negative,
+            ]
+        })
         .chain(
             pairs
                 .unresolved
                 .iter()
-                .flat_map(|pair| [pair.positive.clone(), pair.negative.clone()]),
+                .flat_map(|pair| [&pair.positive, &pair.negative]),
         )
+        .collect();
+    let declared: std::collections::BTreeSet<String> = nets
+        .iter()
+        .filter(|net| {
+            names
+                .iter()
+                .any(|name| *net == *name || net.ends_with(&format!("/{name}")))
+        })
+        .cloned()
         .collect();
     route_lengths::likely_pairs(&nets, &declared)
 }
 
 /// The result's `summary.pours`: how the search gave the board's pours to the
 /// router, run counts by shape, the winner's shape, and one line.
-/// - One shape (`as_exported`): the DSN has no plane, so no pour was tried.
+/// - One shape (`as_exported`): the DSN has no plane. With `omitted_at_export` (the
+///   manifest's `pours_omitted`) the board has pours the export left out; else no
+///   pour was tried.
 /// - Two shapes: both ways were tried; per shape the runs launched, judged and
 ///   passing every gate, and the winner's way.
+///
+/// The winner is the outcome's only when its run was judged, as the result's own.
 pub(crate) fn pours_summary(
     shapes: &[Shape],
     outcome: &crate::route_search::SearchOutcome,
+    omitted_at_export: bool,
 ) -> Value {
     let winner = outcome
         .winner
         .and_then(|position| outcome.runs.get(position))
+        .filter(|record| record.routed.is_some() && record.judged.is_some())
         .map(|record| record.shape);
     let rows: Vec<(Shape, usize, usize, usize)> = shapes
         .iter()
@@ -2380,8 +2408,10 @@ pub(crate) fn pours_summary(
         })
         .collect();
     let tried = shapes.contains(&Shape::Omitted);
-    let line = if !tried {
-        "Pours: none given to the router. The DSN has no plane, so every run routed without a pour. If the board should have pours (plan_pours proposes them), add them with add_zone and refill_zones before export_specctra_dsn, then route again.".to_string()
+    let line = if !tried && omitted_at_export {
+        format!("Pours: left out at the export (export_specctra_dsn's pours: omit). The router never saw them. {REFILL_AFTER_IMPORT}")
+    } else if !tried {
+        "Pours: none given to the router. The DSN has no plane, so every run routed without a pour. If the board should have pours, plan_pours proposes them. Add them with add_zone and refill_zones before export_specctra_dsn, then route again.".to_string()
     } else {
         let part = |shape: Shape, words: &str| {
             rows.iter()
@@ -2395,20 +2425,25 @@ pub(crate) fn pours_summary(
         };
         let won = match winner {
             Some(Shape::AsExported) => " The winner gave the router the pours as planes.",
-            Some(Shape::Omitted) => " The winner routed with the pours left out: the router never saw them, and KiCad fills them after apply_specctra_ses.",
+            Some(Shape::Omitted) => {
+                " The winner routed with the pours left out. The router never saw them."
+            }
             None => " No run won.",
         };
+        let refill = if winner == Some(Shape::Omitted) {
+            format!(" {REFILL_AFTER_IMPORT}")
+        } else {
+            String::new()
+        };
         format!(
-            "Pours: tried two ways. {}. {}.{won}",
+            "Pours: tried two ways. {}. {}.{won}{refill}",
             part(Shape::AsExported, "As planes (the DSN as exported)"),
-            part(
-                Shape::Omitted,
-                "Left out (planes removed, refilled after import)"
-            ),
+            part(Shape::Omitted, "Left out (the planes removed)"),
         )
     };
     json!({
         "tried": tried,
+        "omitted_at_export": omitted_at_export,
         "shapes": rows
             .iter()
             .map(|(shape, launched, judged, passed)| json!({

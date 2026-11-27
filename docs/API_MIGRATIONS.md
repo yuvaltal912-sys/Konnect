@@ -13,12 +13,15 @@ Additive only: no argument changes, nothing removed or renamed, `status` unchang
     declares a group or a pair skew, or the board's `.kicad_dru` has a length or skew
     rule) and `line`. When nothing was checked, `likely_pairs` (`positive`,
     `negative`, `pattern`) lists the board's nets whose names read as pairs (`+/-`,
-    `_P/_N`, `_DP/_DM`, `_H/_L`, `CANH/CANL`, `_A/_B` on a name with 485), leaving
-    out rails, grounds and the intent's own pairs, with `next_step`. Suggestions only:
-    nothing is recorded.
-  - `summary.pours`: `tried` (the DSN has a plane, so both shapes ran), `shapes`
-    (`shape`, `launched`, `judged`, `all_gates_pass` per shape), `winner_shape` and
-    `line`.
+    `_P/_N`, `_DP/_DM`, `_H/_L` and `H/L` on a CAN name, `_A/_B` on a name with
+    485), leaving out rails, grounds, terminal pairs (`BAT+`, `VREF-`, `LED+`) and the
+    intent's own pairs (by name, by `/name` on a sub-sheet, and by DSN name), with
+    `next_step`. Suggestions only: nothing is recorded. The line names an intent or a
+    rules file that could not be read.
+  - `summary.pours`: `tried` (the DSN has a plane, so both shapes ran),
+    `omitted_at_export` (the manifest's `pours_omitted`), `shapes` (`shape`,
+    `launched`, `judged`, `all_gates_pass` per shape), `winner_shape` (only a judged
+    winner) and `line`.
   - `completion.not_checked` is `["lengths"]` when lengths were not checked. The
     result without a group still has no `length_matching` (Row LT, L15).
 - **`plan_convergent_placement`: the winner says what moves.** New
