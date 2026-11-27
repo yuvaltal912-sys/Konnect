@@ -207,9 +207,14 @@ where
         // missing half of it.
         LiveBoard::Unresolved(error) => BoardRead::Refused(ipc_target_error_result(&error)),
 
-        LiveBoard::NeverReached(message) if live_required => {
-            BoardRead::Refused(not_live_enough(what, message))
-        }
+        // Row BS: KiCad down reads as plainly as a board not open.
+        LiveBoard::NeverReached(message) if live_required => BoardRead::Refused(not_live_enough(
+            what,
+            format!(
+                "{} (KiCad's IPC API cannot be reached: {message})",
+                crate::tools::board_safety::not_open_sentence(board_path)
+            ),
+        )),
         LiveBoard::NeverReached(_) => BoardRead::Saved(no_live_board(
             board_path,
             "kicad_ipc_unreachable",

@@ -3,6 +3,40 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: board safety (Row BS)
+
+**A behaviour change** for `route_specctra_dsn`, plus additive fields.
+
+- **`route_specctra_dsn` (both engines) checks the board before it starts.** The
+  board named in the DSN's manifest (`board_path`) must be open in KiCad's PCB
+  editor, or the call refuses at once (`editor_unavailable`), before any search
+  folder is made: "The board is not open in KiCad's PCB editor: open <board> and
+  call again. Nothing was routed: …". A DSN with no readable manifest is not
+  checked; the route refuses it with its own reason, as before. **Migration:** a
+  caller that routes a saved board with no KiCad running (a bench, a smoke check)
+  passes the new argument `require_live_board: false` (default `true`).
+- **"Board not open" reads plainly everywhere.** When KiCad answers
+  `GetOpenDocuments` with `AS_UNHANDLED` (no PCB editor at the endpoint), every
+  tool's message now starts with "the board is not open in KiCad's PCB editor:
+  open <board> and call again", followed by KiCad's own answer. `AS_UNIMPLEMENTED`
+  says Konnect cannot confirm the board is open, and does not claim it is closed.
+  `board_source: "live"` with KiCad unreachable says the same sentence. Error kinds
+  and which calls refuse are unchanged; only message text changed.
+- **`set_component_placements` and `apply_specctra_ses` checkpoint first.** Before
+  the tool runs, the project's saved files are checkpointed (`create_checkpoint`'s
+  store, `reason` `automatic`, label `automatic: before <tool>`); a checkpoint whose
+  files are exactly the saved files now is reused instead. New result field
+  `live_project`: `summary`, `board`, `project`, `board_open_in_kicad`,
+  `unsaved_changes_before_call` (the live board differs from its saved file;
+  `null` when unknown), `checkpoint` (`checkpoint_id`, `created_utc`,
+  `made_by_this_call`, `location`, `locks_present`, or `null`),
+  `checkpoint_skipped_reason`, and `restore` (`tool`, `arguments`,
+  `close_the_board_in_kicad_first`). On a plain-text result it is a second text
+  block. A checkpoint that cannot be made refuses the call (`plan_blocked`) with
+  nothing changed. `apply_specctra_ses` on a board KiCad does not hold takes no
+  checkpoint (it refuses on its own). With no `<board>.kicad_pro` beside the
+  board, the call runs and `live_project` says no checkpoint protects it.
+
 ## Unreleased: the route and placement results say what they did not check
 
 Additive only: no argument changes, nothing removed or renamed, `status` unchanged.

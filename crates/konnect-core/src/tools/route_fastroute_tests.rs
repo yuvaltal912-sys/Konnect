@@ -2107,6 +2107,8 @@ async fn best_of_n_routes_a_public_fixture_end_to_end() {
         "ses_output_path": ses,
         "effort": "fast",
         "fastroute_path": fastroute,
+        // Row BS: these runs route the saved board, with no KiCad.
+        "require_live_board": false,
     });
     let result = handle_route_specctra_dsn(&args, ctx).await.unwrap();
     let parsed = body(&result);
@@ -2178,6 +2180,8 @@ async fn route_pours_with_groups(groups: Value) -> (Value, tempfile::TempDir) {
         "ses_output_path": board_folder.join("routed.ses"),
         "effort": "fast",
         "fastroute_path": fastroute,
+        // Row BS: these runs route the saved board, with no KiCad.
+        "require_live_board": false,
     });
     let result = handle_route_specctra_dsn(&args, ctx).await.unwrap();
     let parsed = body(&result);

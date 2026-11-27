@@ -442,7 +442,9 @@ fn session_checks(smoke: &Smoke, staged: &Staged, checks: &mut Vec<Check>) -> Re
     let started = std::time::Instant::now();
     let (is_error, body) = session.tool(
         "route_specctra_dsn",
-        json!({"dsn_path": staged.dsn, "ses_output_path": staged.ses, "effort": "fast"}),
+        // Row BS: the smoke check routes the public board with no KiCad open.
+        json!({"dsn_path": staged.dsn, "ses_output_path": staged.ses, "effort": "fast",
+               "require_live_board": false}),
         Duration::from_secs(1800),
     )?;
     let _ = std::fs::write(

@@ -666,6 +666,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "below_area",
         // plan_pours's check fields (Row ZR, stage ZR4, PP16).
         "thermal_steps",
+        // The bulk edits' result field (Row BS, board safety).
+        "live_project",
         // plan_convergent_placement's response fields and statuses (Row CT).
         "apply_with",
         "gate_failures",
