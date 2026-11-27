@@ -806,3 +806,212 @@ fn unconnected_is_read_from_the_drc_tally() {
     assert_eq!(unconnected_of(&json!({ "by_rule": [] })), Some(0));
     assert_eq!(unconnected_of(&json!({})), None);
 }
+
+// ─── The mutants' misses ─────────────────────────────────────────────────────
+
+#[test]
+fn gate_a_asks_the_deletion_of_locked_routing_alone() {
+    let mut locked = facts();
+    locked.unlocked_routing = 0;
+    locked.locked_routing = 3;
+    assert!(keys(&needs_at_plan(
+        &locked,
+        &Steps::default(),
+        &Approvals::default()
+    ))
+    .contains(&"delete_routing"));
+    // And no refusal for keeping it when there is no unlocked routing.
+    let keep = Approvals {
+        delete_routing: Some(DeleteAnswer::Keep),
+        ..all_approved()
+    };
+    assert_eq!(refused(&keep, &locked), None);
+}
+
+fn why_skipped(flow: &FlowRecord, step: Step) -> Option<String> {
+    flow.record(step)
+        .filter(|r| r.state == StepState::Skipped)
+        .and_then(|r| r.why.clone())
+}
+
+#[test]
+fn every_skip_says_why_in_its_own_words() {
+    let run = |steps: Steps, approvals: Approvals, facts: PlanFacts, route: Option<RouteFacts>| {
+        let mut flow = flow();
+        flow.steps_asked = steps;
+        flow.approvals = approvals;
+        flow.facts = facts;
+        flow.route = route;
+        flow.put(StepRecord::new(Step::Preflight, StepState::Done));
+        walk(&mut flow);
+        flow
+    };
+    // steps.routing: skip, against routing: skip.
+    let f = run(
+        Steps {
+            routing: RunOrSkip::Skip,
+            ..Steps::default()
+        },
+        all_approved(),
+        facts(),
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::Export).as_deref(),
+        Some("steps.routing is skip")
+    );
+    let f = run(
+        Steps::default(),
+        Approvals {
+            routing: Some(RoutingAnswer::Skip),
+            ..all_approved()
+        },
+        facts(),
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::Export).as_deref(),
+        Some("routing: skip")
+    );
+    // P2's reasons, and P4 runs unless both pours and routing are skipped.
+    let f = run(
+        Steps {
+            pours: PlanOrSkip::Skip,
+            ..Steps::default()
+        },
+        all_approved(),
+        facts(),
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::PoursBefore).as_deref(),
+        Some("steps.pours is skip")
+    );
+    assert!(f.done(Step::PoursAfter), "the export check still runs");
+    let f = run(
+        Steps {
+            placement: RunOrSkip::Skip,
+            ..Steps::default()
+        },
+        all_approved(),
+        PlanFacts {
+            change: None,
+            ..facts()
+        },
+        None,
+    );
+    assert!(why_skipped(&f, Step::PoursBefore)
+        .unwrap()
+        .starts_with("steps.placement is skip"));
+    let f = run(
+        Steps {
+            routing: RunOrSkip::Skip,
+            ..Steps::default()
+        },
+        all_approved(),
+        facts(),
+        None,
+    );
+    assert!(f.done(Step::PoursAfter), "the pours are still planned");
+    // The deletion's reasons.
+    let none = PlanFacts {
+        unlocked_routing: 0,
+        locked_routing: 0,
+        ..facts()
+    };
+    let f = run(
+        Steps::default(),
+        Approvals {
+            delete_routing: Some(DeleteAnswer::Keep),
+            ..all_approved()
+        },
+        none.clone(),
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::DeleteRouting).as_deref(),
+        Some("nothing to delete")
+    );
+    let f = run(
+        Steps {
+            routing: RunOrSkip::Skip,
+            ..Steps::default()
+        },
+        Approvals {
+            delete_routing: Some(DeleteAnswer::Keep),
+            placement: Some(PlacementAnswer::KeepCurrent),
+            ..all_approved()
+        },
+        facts(),
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::DeleteRouting).as_deref(),
+        Some("delete_routing: keep")
+    );
+    let f = run(
+        Steps::default(),
+        Approvals {
+            delete_routing: Some(DeleteAnswer::DeleteIncludingLocked),
+            ..all_approved()
+        },
+        none,
+        None,
+    );
+    assert_eq!(
+        why_skipped(&f, Step::DeleteRouting).as_deref(),
+        Some("nothing to delete")
+    );
+    let locked = PlanFacts {
+        unlocked_routing: 0,
+        locked_routing: 2,
+        ..facts()
+    };
+    let f = run(
+        Steps::default(),
+        Approvals {
+            delete_routing: Some(DeleteAnswer::DeleteIncludingLocked),
+            ..all_approved()
+        },
+        locked,
+        None,
+    );
+    assert!(
+        f.done(Step::DeleteRouting),
+        "locked routing is deleted when asked"
+    );
+    // The placement's reasons.
+    let f = run(
+        Steps::default(),
+        all_approved(),
+        PlanFacts {
+            change: Some("none".into()),
+            ..facts()
+        },
+        None,
+    );
+    assert!(why_skipped(&f, Step::ApplyPlacement)
+        .unwrap()
+        .starts_with("change: none"));
+    // Plane stitching present, reference vias absent.
+    let route = RouteFacts {
+        all_gates_pass: Some(true),
+        plane_stitching: true,
+        ..RouteFacts::default()
+    };
+    let f = run(Steps::default(), all_approved(), facts(), Some(route));
+    assert!(f.done(Step::PlaneStitch));
+    assert!(why_skipped(&f, Step::ReferenceVias)
+        .unwrap()
+        .contains("reference-via"));
+    let route = RouteFacts {
+        all_gates_pass: Some(true),
+        reference_vias: true,
+        ..RouteFacts::default()
+    };
+    let f = run(Steps::default(), all_approved(), facts(), Some(route));
+    assert!(f.done(Step::ReferenceVias));
+    assert!(why_skipped(&f, Step::PlaneStitch)
+        .unwrap()
+        .contains("plane-stitching"));
+}

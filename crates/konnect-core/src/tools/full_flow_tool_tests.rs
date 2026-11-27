@@ -56,6 +56,8 @@ struct Fake {
     intents: Mutex<Vec<String>>,
     route: Mutex<Value>,
     deleted: Mutex<bool>,
+    sent: Mutex<Vec<(String, Value)>>,
+    pauses: AtomicUsize,
 }
 
 fn ok(body: Value) -> Called {
@@ -171,6 +173,10 @@ impl FlowIo for Arc<Fake> {
             ""
         };
         self.log.lock().unwrap().push(format!("{tool}{dry}"));
+        self.sent
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.clone()));
         if let Some(file) = self.flow_file.lock().unwrap().as_ref() {
             if let Ok(flow) = read_json(file) {
                 let at = flow["at"].as_str().unwrap_or_default().to_string();
@@ -215,6 +221,7 @@ impl FlowIo for Arc<Fake> {
     }
 
     fn pause(&self, _pause: Duration) -> BoxFuture<()> {
+        self.pauses.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(()))
     }
 }
@@ -1911,4 +1918,263 @@ async fn a_read_refused_after_a_saved_round_is_not_uncertain() {
     let record = flow.record(Step::PlaneStitch).unwrap();
     assert_eq!(record.state, StepState::Failed, "{:?}", record.why);
     assert_eq!(record.rounds.len(), 1);
+}
+
+// ─── The mutants' misses ─────────────────────────────────────────────────────
+
+#[test]
+fn wait_s_of_600_is_accepted() {
+    assert!(matches!(
+        read_request(&json!({ "run_id": "1700000000000-0123456789ab", "wait_s": 600 })),
+        Ok(Request::Report { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_read_pauses_only_between_tries() {
+    let fake = Fake::new();
+    fake.live_failures.store(2, Ordering::SeqCst);
+    with_tries(&fake, || fake.live_text()).await.unwrap();
+    assert_eq!(fake.pauses.load(Ordering::SeqCst), 2);
+    let fine = Fake::new();
+    with_tries(&fine, || fine.live_text()).await.unwrap();
+    assert_eq!(fine.pauses.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_refused_save_does_not_verify_even_on_an_unchanged_board() {
+    let fake = Fake::new();
+    fake.script(
+        "save_project",
+        Called::Answered(CallToolResult::error("no board")),
+    );
+    assert!(verified_save(&fake)
+        .await
+        .unwrap_err()
+        .contains("save_project refused"));
+}
+
+#[tokio::test]
+async fn already_done_sends_its_own_arguments_and_reads_refusals_as_not_done() {
+    let mut planned = planned();
+    planned.flow.approvals.delete_routing = Some(DeleteAnswer::DeleteIncludingLocked);
+    let fake = Fake::new();
+    already_done(Step::DeleteRouting, &planned.state, &planned.flow, &fake)
+        .await
+        .unwrap();
+    let sent = fake.sent.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(sent.1["include_locked"], true);
+    // A refused preview is not "done", whatever its body says.
+    let fake = Fake::new();
+    let mut noop_error = CallToolResult::json(&json!({ "status": "noop" }));
+    noop_error.is_error = true;
+    fake.script("delete_all_routing", Called::Answered(noop_error.clone()));
+    assert!(
+        !already_done(Step::DeleteRouting, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+    write_value(
+        &route_folder(&planned.state, &planned.flow).join(ROUTE_FILE),
+        &route_body(),
+    )
+    .unwrap();
+    fake.script("create_custom_drc_rule", Called::Answered(noop_error));
+    assert!(
+        !already_done(Step::LengthRules, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_leg_ended_mid_call_is_uncertain_only_for_a_writing_step() {
+    let planned = planned();
+    for (step, state, uncertain) in [
+        (Step::ApplyPlacement, StepState::Calling, true),
+        (Step::ApplyPlacement, StepState::Failed, false),
+        (Step::Route, StepState::Calling, false),
+    ] {
+        let mut flow = planned.flow.clone();
+        flow.state = FlowState::Running;
+        flow.at = Some(step);
+        flow.records.retain(|r| r.step < step);
+        let mut record = StepRecord::new(step, state);
+        record.before = Some("b".into());
+        flow.put(record);
+        save_flow(&planned.state, &flow).unwrap();
+        leg_ended(&planned.state, &mut flow, "stopped");
+        assert_eq!(flow.state, FlowState::Stopped);
+        assert_eq!(
+            flow.board_state == BoardState::Uncertain,
+            uncertain,
+            "{step:?} {state:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_waits_for_the_leg_before_it_and_a_failed_leg_stops_the_flow() {
+    let planned = planned();
+    let jobs = Jobs::default();
+    let board = PathBuf::from(&planned.flow.board);
+    let leg = |id: &str| -> PathBuf {
+        let folder = run_folder_of(&planned.state, &FLOW_LEGS, id);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    };
+    // A leg that has not ended.
+    let running = "1700000000001-aaaaaaaaaaaa";
+    let claim = claim_board(&planned.state, &FLOW_LEGS, &board, running)
+        .unwrap()
+        .unwrap();
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    jobs.start(
+        &FLOW_LEGS,
+        claim,
+        &board,
+        leg(running),
+        Arc::new(FlowProgress::default()),
+        async move {
+            let _ = wait.await;
+            Ok(json!({}))
+        },
+    )
+    .unwrap();
+    let mut flow = planned.flow.clone();
+    flow.legs = vec![running.to_string()];
+    assert!(last_leg_ended(&jobs, &planned.state, &mut flow)
+        .await
+        .is_err());
+    let _ = release.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(last_leg_ended(&jobs, &planned.state, &mut flow)
+        .await
+        .is_ok());
+    // A leg that failed without recording the flow's end.
+    let failed = "1700000000002-bbbbbbbbbbbb";
+    let claim = claim_board(&planned.state, &FLOW_LEGS, &board, failed)
+        .unwrap()
+        .unwrap();
+    jobs.start(
+        &FLOW_LEGS,
+        claim,
+        &board,
+        leg(failed),
+        Arc::new(FlowProgress::default()),
+        async move { anyhow::bail!("the leg broke") },
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut flow = planned.flow.clone();
+    flow.state = FlowState::Running;
+    flow.at = Some(Step::ApplyPlacement);
+    flow.legs = vec![failed.to_string()];
+    save_flow(&planned.state, &flow).unwrap();
+    last_leg_ended(&jobs, &planned.state, &mut flow)
+        .await
+        .unwrap();
+    assert_eq!(flow.state, FlowState::Stopped);
+    assert!(flow.stop_reason.unwrap().contains("the leg broke"));
+}
+
+fn gated(gate: Gate) -> FlowRecord {
+    let mut flow = planned().flow;
+    flow.gate = Some(gate);
+    flow.plan_revision = Some("rev".into());
+    flow
+}
+
+#[test]
+fn apply_answer_keeps_each_gates_own_rules() {
+    // A key already set cannot change at gate R (only a refused gate A allows it).
+    let mut flow = gated(Gate::Roles);
+    let other = Approvals {
+        placement: Some(PlacementAnswer::KeepCurrent),
+        ..Approvals::default()
+    };
+    assert!(apply_answer(&mut flow, Gate::Roles, &other, "rev").is_err());
+    // Gate A with keys missing is refused.
+    let mut flow = gated(Gate::Plan);
+    flow.approvals = Approvals::default();
+    let partial = Approvals {
+        placement: Some(PlacementAnswer::Apply),
+        ..Approvals::default()
+    };
+    assert!(
+        apply_answer(&mut flow, Gate::Plan, &partial, "rev")
+            .unwrap_err()
+            .is_error
+    );
+    // Roles changed at gate A: P4 again, and the placement says it was judged with the
+    // earlier roles.
+    let mut flow = gated(Gate::Plan);
+    let roles = Approvals {
+        pour_roles: Some(RolesAnswer::Map(BTreeMap::from([(
+            "GND".to_string(),
+            GivenRole::Ground,
+        )]))),
+        ..Approvals::default()
+    };
+    apply_answer(&mut flow, Gate::Plan, &roles, "rev").unwrap();
+    assert!(flow.record(Step::PoursAfter).is_none());
+    assert!(flow
+        .record(Step::Placement)
+        .unwrap()
+        .not_checked
+        .iter()
+        .any(|n| n.contains("earlier pour roles")));
+}
+
+#[tokio::test]
+async fn resume_keeps_the_right_records() {
+    let fake = Fake::new();
+    let state = tempfile::tempdir().unwrap();
+    // A plan step: only the pre-flight stays.
+    let mut flow = planned().flow;
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::PoursAfter);
+    flow.records.retain(|r| r.step < Step::PoursAfter);
+    resume_step(state.path(), &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        flow.records.iter().map(|r| r.step).collect::<Vec<_>>(),
+        [Step::Preflight]
+    );
+    // L1: its own record goes, the plan stays.
+    let mut flow = planned().flow;
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::Unchanged);
+    flow.put(StepRecord::new(Step::Unchanged, StepState::Failed));
+    resume_step(state.path(), &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(flow.record(Step::Unchanged).is_none());
+    assert!(flow.done(Step::PoursAfter));
+    // A read step stopped as board_changed is refused.
+    let mut flow = planned().flow;
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::Unchanged);
+    flow.put(StepRecord::new(Step::Unchanged, StepState::Failed));
+    flow.stop_reason = Some("board_changed: elsewhere".into());
+    assert!(resume_step(state.path(), &mut flow, &fake)
+        .await
+        .unwrap()
+        .is_err());
+    // A writing step stopped as board_changed before its intent runs again once the
+    // board is back where the step before left it.
+    let mut flow = planned().flow;
+    flow.state = FlowState::Stopped;
+    flow.at = Some(Step::DeleteRouting);
+    flow.put(StepRecord::new(Step::Unchanged, StepState::Done));
+    flow.put(StepRecord::new(Step::DeleteRouting, StepState::Failed));
+    flow.stop_reason = Some("board_changed: restored since".into());
+    resume_step(state.path(), &mut flow, &fake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow.state, FlowState::Running);
 }
