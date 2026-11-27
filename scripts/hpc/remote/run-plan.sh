@@ -47,6 +47,39 @@ want=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
 [ "$head" = "$SHA" ] || { echo "checkout is $head, expected $SHA" >>"$OUT/env.txt"; exit 4; }
 rustc -V | grep -q "^rustc $want " || { echo "toolchain is not $want" >>"$OUT/env.txt"; exit 4; }
 
+# `cargo mutants` never sees the shared CARGO_TARGET_DIR. It copies the tree once per job, and
+# with --jobs above 1 every copy built into the one shared target and every mutant read
+# unviable (job 20899: 81 of 81); without it each copy builds in its own target (job 20920).
+# Ordinary steps keep the shared target, the warm cache. Wrappers early on PATH unset it for a
+# `cargo [+toolchain] [options] mutants ...` or `cargo-mutants ...` process, whatever the step's
+# command looks like, and say so in the step's log.
+SHIM="$RUN/scratch/bin"
+mkdir -p "$SHIM"
+real_cargo=$(command -v cargo)
+real_mutants=$(command -v cargo-mutants || true)
+cat >"$SHIM/cargo" <<EOF
+#!/bin/bash
+for a in "\$@"; do
+    case "\$a" in
+        +* | -*) ;;
+        mutants) [ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
+                 unset CARGO_TARGET_DIR; break ;;
+        *) break ;;
+    esac
+done
+exec $(printf %q "$real_cargo") "\$@"
+EOF
+if [ -n "$real_mutants" ]; then
+    cat >"$SHIM/cargo-mutants" <<EOF
+#!/bin/bash
+[ -n "\${CARGO_TARGET_DIR:-}" ] && echo "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR" >&2
+unset CARGO_TARGET_DIR
+exec $(printf %q "$real_mutants") "\$@"
+EOF
+fi
+chmod +x "$SHIM"/*
+export PATH="$SHIM:$PATH"
+
 # Sum the libtest summaries ("test result: ok. 12 passed; 0 failed; 3 ignored; ...").
 counts() {
     awk '/^test result:/ { r++; for (i = 2; i <= NF; i++) {

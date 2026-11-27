@@ -1,7 +1,8 @@
 # Offloading test runs to the BGU HPC cluster
 
-Status 2026-11-27: working. Four real jobs ran on the cluster on 2026-11-27 (jobs 20894, 20895,
-20896 and 20898, all on `hpc-node5`); the measured values below come from them. Their records are
+Status 2026-11-27: working. Real jobs ran on the cluster on 2026-11-27: 20894, 20895, 20896 and
+20898 on `hpc-node5`, then the mutants jobs 20899, 20915 and 20920 (one PR's batch, on
+`hpc-node5` and `hpc-node7`); the measured values below come from them. Their records are
 in the main checkout's `target/hpc-runs/` (20896, the one-off `cargo-mutants` install, has no
 record folder; its times come from `sacct`). Values still
 marked *unmeasured* are not settled by those runs. `scripts/hpc/selftest.sh` also runs the
@@ -115,18 +116,21 @@ Measured on the cluster, 2026-11-27 (16 CPUs, 16 GB, `hpc-node5`, x86_64):
 | Queue wait | none: `sacct` gives the same submit and start time for all four jobs (one afternoon; a busy week may differ) |
 | `konnect-sexp` tests (`--lib`) | 168 s cold, including its build; 32 s warm. 227 passed, 2 ignored |
 | `konnect-core` cold build plus the `place_converge` tests | 245 s for the step, of which the tests took 77 s |
-| `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4` | 42 mutants in 6 minutes |
+| `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4` (job 20898, with the shared target) | 42 mutants in 6 minutes |
+| One PR's mutants batch: `konnect-core/src/tools/netclass_live.rs`, `--jobs 6` on 32 CPUs (job 20920, `hpc-node7`) | 81 mutants in 19.6 minutes: 75 caught, 3 missed, 3 unviable. The Mac's run of the same batch: 22 minutes, the same 3 missed |
 | `target/` after those runs | 2.3 GB (`du`, read over ssh after job 20898) |
 | Disk | the home folder is on a shared 166 TB file system with 112 TB free; `quota` reports no user quota. The node's `/tmp` has 59 GB free |
 | Network from the compute node | reaches crates.io |
 
-*Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, a mutants batch at the
-size of a PR's (100 or more mutants), the queue at busy times, and the two example plans exactly as
-committed (`first-probe.plan` with its `--skip`, `mutants-probe.plan` with its last check).
+*Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, the queue at busy times,
+other `--jobs` values, and the two example plans exactly as committed (`first-probe.plan` with its
+`--skip`, `mutants-probe.plan` with its last check).
 
-Expected gain (*unmeasured* end to end): a mutants batch leaves the Mac's lane altogether, which
-is 20 to 60 minutes of `instr.lock` per batch that gates no longer wait behind. With the 1-job quota,
-the four sessions share one cluster job at a time, so the cluster is a second lane, not four.
+The gain: one mutants batch on the cluster is about as fast as on the Mac (19.6 against 22
+minutes for the same 81 mutants), so the gain is not speed. It is the second lane: the batch
+leaves the Mac's `instr.lock`, 20 to 60 minutes per batch that gates no longer wait behind. With
+the 1-job quota, the four sessions share one cluster job at a time, so the cluster is a second
+lane, not four.
 
 ## 3. How a run works
 
@@ -214,7 +218,8 @@ any                mutants  cargo mutants -p konnect-core --file crates/konnect-
 Two example plans are in `scripts/hpc/plans/`: `first-probe.plan` (tools, disk and network on the
 node, then two focused test runs) and `mutants-probe.plan` (one file's mutants). An `any` step
 reads `recorded(exit N)` for every non-zero exit, so a mutants plan ends with a `pass` step that
-checks that at least one mutant was tested; without it a red baseline would look green.
+checks that at least one mutant was really tested (caught, missed or timed out); without it a
+red baseline, or a batch that is all unviable, would look green.
 
 `hpc-fetch` ends `evidence.txt` with one line: `ALL STEPS AS EXPECTED`, `NOT AS EXPECTED`,
 `INCOMPLETE` (steps missing: wall time or a crash), `NOT CLEAN` (every step as expected but Slurm
@@ -224,10 +229,24 @@ Mutants on the cluster use `cargo-mutants` 27.1.0, the Mac's version. It was ins
 2026-11-27, in `~/.cargo/bin` by a separate one-off Slurm job on a compute node (job 20896, 8 CPUs,
 1.5 minutes), with `cargo install --locked cargo-mutants --version 27.1.0` and the home folder's
 default toolchain (1.100), not the pinned one. Repeat that the same way if it is ever missing;
-`env.txt` records the version each job sees. The mutants probe ran with `--jobs 4` on 16 CPUs and
-`CARGO_TARGET_DIR` set as usual: 19 caught, 22 unviable, 1 missed. The missed mutant
+`env.txt` records the version each job sees.
+
+**`cargo mutants` never sees the shared `CARGO_TARGET_DIR`.** cargo-mutants copies the tree once
+per job. With `--jobs` above 1 and the shared target every copy built into that one folder, and
+every mutant read unviable: job 20899 read 81 of 81 unviable on one PR's batch at `--jobs 6`.
+`--jobs 1` worked with and without the shared target (job 20915: 3 of 3 caught both ways), and
+`env -u CARGO_TARGET_DIR` at `--jobs 6` gave the Mac's result (job 20920, in the table above).
+So `run-plan.sh` puts two wrappers first on `PATH`: one for `cargo` that unsets the variable when
+the subcommand (the first word that is not an option or a `+toolchain`) is `mutants`, and one
+for `cargo-mutants`. A plan author needs no `env -u`, and a step's log says
+`hpc: cargo mutants runs without the shared CARGO_TARGET_DIR`. Every other cargo command keeps
+the shared target, the warm cache, even in the same step. Each mutants copy builds cold, so a
+batch spends a few minutes on the baseline build (180 s for `konnect-core`).
+
+The net.rs probe (job 20898, `--jobs 4`, 16 CPUs) ran before that fix: 19 caught, 22 unviable,
+1 missed. Some of its 22 unviable may come from the shared target. The missed mutant
 (`names_nets_in_place` in `konnect-sexp/src/net.rs` replaced with `true`) is a gap that is already
-on `main`, not something these scripts caused. Tune `--jobs` on a PR-sized batch.
+on `main`, not something these scripts caused.
 
 ### Commands
 
@@ -272,5 +291,5 @@ worktree). Settings (host alias, work folder, partition, account, QoS, image) ar
 
 - A first full `cargo test --workspace --lib --tests` on Linux, with the list of macOS-only
   failures to `--skip`.
-- A PR-sized mutants batch, to tune `--jobs` and compare with the Mac's 23 to 56 minutes.
+- Other `--jobs` values on a PR-sized batch (only `--jobs 6` on 32 CPUs is measured).
 - The lane README line in section 4, for the supervisor or the owner to add.

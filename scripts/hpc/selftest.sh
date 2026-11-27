@@ -57,8 +57,17 @@ if [ -e "$F/state/wrong-rustc" ]; then echo "rustc 1.100.0 (fake)"; else echo "r
 EOF
 cat >"$F/bin/cargo" <<'EOF'
 #!/bin/bash
-case "$1" in fetch) ;; -V) echo "cargo 1.96.0 (fake)" ;; *) exit 1 ;; esac
+case "$1" in
+    fetch) ;;
+    -V) echo "cargo 1.96.0 (fake)" ;;
+    *) case " $* " in
+        *" mutants "*) echo "fake mutants target=${CARGO_TARGET_DIR:-unset}" ;;
+        *" test "*) echo "fake test target=${CARGO_TARGET_DIR:-unset}" ;;
+        *) exit 1 ;;
+       esac ;;
+esac
 EOF
+printf '#!/bin/bash\necho "fake mutants target=${CARGO_TARGET_DIR:-unset}"\n' >"$F/bin/cargo-mutants"
 # curl serves a fake protoc release zip and logs each download; nothing leaves the machine.
 cat >"$F/bin/curl" <<EOF
 #!/bin/bash
@@ -152,6 +161,20 @@ check "fetch: counts summed"      0 "unit  *pass  *0  *[0-9]*  *5  *0  *1  *ok "
 check "fetch: overall"            0 "NOT AS EXPECTED" "$fetch"
 check "fetch: dirty record-only step" 0 "dirtyprobe .* recorded(exit 3)+DIRTY " "$fetch"
 check "fetch: odd record noted"   0 "NOTE: record-only steps that exited non-zero: probe" "$fetch"
+# cargo mutants never sees the shared CARGO_TARGET_DIR; ordinary cargo steps keep it.
+cat >"$F/plan/target.plan" <<'EOF'
+pass tgt-mutants    cargo mutants --jobs 2 --timeout 60 2>/dev/null | grep -qx "fake mutants target=unset"
+pass tgt-toolchain  cargo +1.96.0 --locked mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
+pass tgt-direct     cargo-mutants mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
+pass tgt-explicit   CARGO_TARGET_DIR=/tmp/elsewhere cargo mutants --jobs 2 2>/dev/null | grep -qx "fake mutants target=unset"
+pass tgt-test       cargo test -p x 2>/dev/null | grep -qx "fake test target=$(cd ../ && pwd)/target"
+pass tgt-after      cargo mutants >/dev/null 2>&1; cargo test | grep -q "target=/.*/target$"
+pass tgt-note       cargo mutants 2>&1 >/dev/null | grep -qx "hpc: cargo mutants runs without the shared CARGO_TARGET_DIR"
+pass tgt-arg        cargo test -p mutants-helper 2>/dev/null | grep -q "fake test target=/"
+EOF
+check "mutants target plan" 0 "submitted" "$sub" "$F/plan/target.plan"
+check "mutants: own targets, other steps shared" 0 "ALL STEPS AS EXPECTED (8 steps)" "$fetch"
+
 printf 'pass a true\nfail:ctl/break.patch c echo other\n' >"$F/plan/nobase.plan"
 check "control without baseline refused" 1 "has no baseline" "$sub" "$F/plan/nobase.plan" --dry-run
 [ ! -d "$F/remote/run.lock" ] && { ok=$((ok + 1)); echo "ok    lock released"; } || { bad=$((bad + 1)); echo "FAIL  lock left behind"; }

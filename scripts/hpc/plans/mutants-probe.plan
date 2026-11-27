@@ -1,13 +1,19 @@
 # cargo mutants on one file, on the cluster. Needs cargo-mutants in ~/.cargo/bin
 # (docs/HPC_OFFLOAD.md). Job 20898 (16 CPUs) ran an earlier form of this plan, with the lists
-# in $TMPDIR and a trailing echo: 42 mutants in 6 minutes. This exact form has not run yet.
+# in $TMPDIR and a trailing echo, and with the shared CARGO_TARGET_DIR: 42 mutants in 6 minutes.
 # Submit: scripts/hpc/hpc-submit --cpus 16 --mem 16G --time 0:30:00 --label "mutants probe" scripts/hpc/plans/mutants-probe.plan
+#
+# run-plan.sh runs every `cargo mutants` without the shared CARGO_TARGET_DIR, so --jobs above 1
+# is safe: each of cargo-mutants' copies builds in its own target. With the shared target, job
+# 20899 read 81 of 81 mutants unviable at --jobs 6.
 #
 # `any`: cargo mutants exits 2 when a mutant is missed, which reads recorded(exit 2), and
 # hpc-fetch notes it. Any other failure (a red baseline, a usage error) also reads
-# recorded(exit N), so the last step is a `pass` check that at least one mutant was tested.
+# recorded(exit N), so the last step is a `pass` check that at least one mutant was really
+# tested (caught, missed or timed out). Unviable ones do not count: a batch that is all
+# unviable is a broken build, not a result.
 # The lists (caught.txt, missed.txt, ...) come back under out/mutants.out/.
 # EXPECT  NAME             COMMAND
 any       mutants-version  cargo mutants --version
 any       mutants-net      cargo mutants -p konnect-sexp --file crates/konnect-sexp/src/net.rs --jobs 4 --timeout 120 --output "$RUN_OUT"
-pass      mutants-ran      cd "$RUN_OUT/mutants.out" && cat caught.txt missed.txt timeout.txt unviable.txt | grep -q .
+pass      mutants-ran      cd "$RUN_OUT/mutants.out" && cat caught.txt missed.txt timeout.txt | grep -q .
