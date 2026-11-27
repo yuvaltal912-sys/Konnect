@@ -23,11 +23,17 @@ step. Before it, a board that `export_specctra_dsn` refused for unlocked routing
   after: teardrop zones, groups, generated tuning patterns). A planned item still on the
   board, a locked item gone, a new routing item or any other object changed is
   `mutation_outcome_uncertain` and names what differs. The board is not saved.
-- `include_locked` (default `false`): locked tracks, arcs and vias are kept unless it is
-  `true`. "Locked" is `(locked yes)` in the board text, as the Specctra export reads it.
-- Only top-level `segment`, `arc` and `via` items are routing. Zones (teardrops
-  included), footprints, graphics, text and every other object are never sent to KiCad
-  for deletion.
+- `include_locked` (default `false`): locked tracks, arcs and vias, and routing held by a
+  locked group (nested groups too), are kept unless it is `true`. `kept_locked` counts
+  them (`held_only_by_locked_groups`) and lists in `export_will_refuse` the kept items
+  `export_specctra_dsn` would still refuse (a group-only lock, locked arcs, blind or
+  micro vias, vias that are not through vias, drills it cannot take, no net, zero-length
+  tracks, a lock written the old way).
+- Only top-level `segment`, `arc` and `via` items are sent to KiCad for deletion. Zones,
+  footprints, graphics and text never are; KiCad itself may remove the teardrop zones,
+  tuning patterns and routing-only groups that belong to deleted tracks, which
+  `never_touched.kicad_updated` says (for example "KiCad removed 4 teardrop_zones with
+  their tracks").
 
 ## Unreleased: the route and placement results say what they did not check
 

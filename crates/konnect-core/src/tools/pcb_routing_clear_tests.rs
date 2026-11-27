@@ -263,6 +263,8 @@ async fn the_preview_counts_by_kind_net_and_layer_and_writes_nothing() {
             .as_str()
             .unwrap()
             .contains(body["plan_revision"].as_str().unwrap()));
+        assert_eq!(body["never_touched"]["what"], NEVER_DELETED);
+        assert_eq!(body["never_touched"]["linked_objects"], json!({}));
     }
     h.untouched();
     assert_eq!(h.held_ids().len(), 7);
@@ -371,7 +373,10 @@ async fn a_pour_gone_after_the_delete_is_an_uncertain_outcome() {
         "{body}"
     );
     let text = body["message"].as_str().unwrap();
-    assert!(text.contains("other objects changed: zone"), "{text}");
+    assert!(
+        text.contains("other objects changed: zone: 1 gone or changed, 0 new or changed"),
+        "{text}"
+    );
 }
 
 /// Guard: the read-back names a planned item KiCad kept, and a locked item it lost.
@@ -722,9 +727,27 @@ fn a_group_is_compared_without_its_routing_members() {
     // A group that lost a non-routing member did change.
     let lost = r#"(group "g" (uuid "g-1") (members))"#;
     let after = BoardReading::of(&board_text(&[lost])).unwrap();
-    assert!(compare(&plan, &before, &after)
-        .unwrap_err()
-        .contains("other objects changed: group"));
+    assert_eq!(
+        compare(&plan, &before, &after).unwrap_err(),
+        "other objects changed: group: 1 gone or changed, 0 new or changed"
+    );
+    // Only a group's members are compared without routing: its other fields count.
+    let group = |lock: &str| {
+        format!(
+            r#"(group "g" (uuid "g-1") (locked {lock}) (members "s-1" "11111111-1111-4111-8111-111111111111"))"#
+        )
+    };
+    let (plan, before) = Plan::of(
+        Path::new("b.kicad_pcb"),
+        &board_text(&[SEGMENT_GND, &group("no")]),
+        false,
+    )
+    .unwrap();
+    let after = BoardReading::of(&board_text(&[&group("yes")])).unwrap();
+    assert_eq!(
+        compare(&plan, &before, &after).unwrap_err(),
+        "other objects changed: group: 1 gone or changed, 1 new or changed"
+    );
 }
 
 #[test]
@@ -798,7 +821,11 @@ fn a_group_of_routing_only_is_linked_before_and_after_the_delete() {
         false,
     )
     .unwrap();
-    assert_eq!(before.linked.get("groups_of_routing_only"), Some(&1));
+    assert_eq!(
+        before.linked,
+        BTreeMap::from([("groups_of_routing_only", 1)]),
+        "only the group is linked, never a footprint"
+    );
     // KiCad empties the group, keeps it with a dangling member, or removes it.
     for after in [
         r#"(group "" (uuid "g-r") (members))"#,
@@ -833,4 +860,10 @@ fn kept_vias_the_export_cannot_take_and_unnetted_locks_are_named() {
             Some("a lock written the old way (the export reads it as unlocked)"),
         ]
     );
+}
+
+#[test]
+fn the_module_registers_one_live_tool() {
+    let names: Vec<&str> = tools().iter().map(|t| t.name).collect();
+    assert_eq!(names, ["delete_all_routing"]);
 }
