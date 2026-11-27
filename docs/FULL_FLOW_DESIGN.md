@@ -2,8 +2,9 @@
 
 **State, 2026-11-27.** Designed down to function skeletons on branch
 `claude/full-flow-design-1a7eef`, from `fork/main` `9232b2b6` (Row HS, #124). Nothing is
-built. The build waits until B, C, D and E have merged, and needs the owner's word on the
-decisions at the end of this note.
+built. The owner approved the four decisions at the end of this note as recommended
+("Yes, all four", 2026-11-27, relayed by the supervisor session). The build waits until B,
+C, D and E have merged, and for his word to build.
 
 An agent that did not write the note (Sonnet 5.5, high) checked it against main and the
 four branches. It found 2 blockers, 12 majors and 7 minors, and all of them are folded into
@@ -474,6 +475,8 @@ replace them.
 | FF17 | P4 ends with `place_route::export_candidate` on the board F will build (the winner with P4's zones), whenever routing will run | Nothing destructive happens until the export is known to accept the new board. The export refuses more than unlocked routing |
 
 ## Decisions for the owner
+
+Answered 2026-11-27: all four as recommended ("Yes, all four").
 
 1. **The tool's shape.** One tracked job that writes the board itself, only at the points
    you approved, through the same tools the AI uses by hand. *Recommended: yes.*
