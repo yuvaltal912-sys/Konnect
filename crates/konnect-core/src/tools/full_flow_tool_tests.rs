@@ -1354,3 +1354,14 @@ async fn registry_calls_refuse_bad_arguments_before_the_handler() {
         "a call refused before its handler is not recorded"
     );
 }
+
+#[test]
+fn a_route_with_only_the_reference_group_has_no_plane_stitching() {
+    let mut body = route_body();
+    let steps = body["completion"]["next_steps"].as_array_mut().unwrap();
+    // Drop the plane group (steps 6 to 8): a board with no plane nets.
+    steps.retain(|step| !matches!(step["step"].as_u64(), Some(6..=8)));
+    let follow = route_follow_ups(&body);
+    assert!(follow.plane.is_none());
+    assert_eq!(follow.reference.as_ref().unwrap()[0]["step"], 9);
+}
