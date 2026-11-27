@@ -19,7 +19,7 @@ Additive only: no argument changes, nothing removed or renamed, `status` unchang
     `next_step`. Suggestions only: nothing is recorded. The line names an intent or a
     rules file that could not be read.
   - `summary.pours`: `tried` (the DSN has a plane, so both shapes ran),
-    `omitted_at_export` (the manifest's `pours_omitted`), `shapes` (`shape`,
+    `omitted_at_export` (the manifest's `pours_omitted` on a board with a pour), `shapes` (`shape`,
     `launched`, `judged`, `all_gates_pass` per shape), `winner_shape` (only a judged
     winner) and `line`.
   - `completion.not_checked` is `["lengths"]` when lengths were not checked. The

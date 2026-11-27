@@ -4597,6 +4597,17 @@ fn the_pour_summary_tells_pours_left_out_at_export_from_no_pours() {
     // The negative control: the same search without the manifest's flag.
     let none = pours_summary(&[Shape::AsExported], &search.outcome, false);
     assert!(none["line"].as_str().unwrap().contains("add_zone"));
+    // Without a winner there is no `completion.next_steps` to point at.
+    let mut lost = finished_search();
+    lost.outcome.winner = None;
+    let line = pours_summary(&[Shape::AsExported], &lost.outcome, true)["line"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        line.contains("Once a routed session is imported") && !line.contains("next_steps"),
+        "{line}"
+    );
 
     // The omitted shape wins: the refill sentence; the planes win: none.
     search.outcome.winner = Some(1);
@@ -4622,18 +4633,30 @@ fn the_summary_reads_the_export_flag_from_the_manifest() {
     let search = finished_search();
     std::fs::write(
         search.root.join("board.dsn.konnect.json"),
-        json!({ "supported_profile": { "pours_omitted": true } }).to_string(),
+        json!({ "supported_profile": { "pours_omitted": true, "zone_plane_count": 2 } })
+            .to_string(),
     )
     .unwrap();
-    let body = summary_json(
-        &search.root.join("board.dsn"),
-        &[Shape::AsExported],
-        &search.outcome,
-        &PairsPlan::default(),
-        &LengthPlan::default(),
-        Some(true),
-    );
-    assert_eq!(body["pours"]["omitted_at_export"], true);
+    let read = || {
+        summary_json(
+            &search.root.join("board.dsn"),
+            &[Shape::AsExported],
+            &search.outcome,
+            &PairsPlan::default(),
+            &LengthPlan::default(),
+            Some(true),
+        )
+    };
+    assert_eq!(read()["pours"]["omitted_at_export"], true);
+    // A board with no pour, exported with pours: omit, has the flag too: no pour
+    // was left out.
+    std::fs::write(
+        search.root.join("board.dsn.konnect.json"),
+        json!({ "supported_profile": { "pours_omitted": true, "zone_plane_count": 0 } })
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(read()["pours"]["omitted_at_export"], false);
     std::fs::remove_file(search.root.join("board.dsn.konnect.json")).unwrap();
     let body = summary_json(
         &search.root.join("board.dsn"),

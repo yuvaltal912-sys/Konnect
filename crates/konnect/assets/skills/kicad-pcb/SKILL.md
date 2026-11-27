@@ -438,8 +438,9 @@ Read the fastroute result's `summary` before you report it.
 - `summary.pours.line` says how the pours reached the router. It names one of
   three cases: no pour at all (add pours before the export), pours left out at
   the export, or both ways tried, with each way's judged and passing runs and the
-  way the winner took. Pours the router did not see are filled by the refill step
-  in `completion.next_steps`, not by `apply_specctra_ses`.
+  way the winner took. Pours the router did not see are not filled by
+  `apply_specctra_ses`: with a winner, the refill step in `completion.next_steps`
+  fills them.
 
 ### Freerouting round trip
 

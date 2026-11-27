@@ -2292,6 +2292,9 @@ pub(crate) fn result_json(
 /// refill, the DRC step of `completion.next_steps` does.
 const REFILL_AFTER_IMPORT: &str = "apply_specctra_ses does not fill them: the run_drc step with refill_zones in `completion.next_steps` does.";
 
+/// The same without a winner, whose result has no `completion`.
+const REFILL_WITHOUT_WINNER: &str = "Once a routed session is imported, fill them with run_drc and refill_zones: apply_specctra_ses does not.";
+
 /// The result's `summary`: one plain line each on lengths
 /// ([`LengthPlan::summary_json`]) and pours ([`pours_summary`]), so that a reader
 /// sees what `status` covers and what it does not. `g4_pass` is the winner's G4
@@ -2310,9 +2313,14 @@ pub(crate) fn summary_json(
     } else {
         board_likely_pairs(manifest.as_ref(), pairs)
     };
-    let omitted_at_export = manifest
-        .as_ref()
-        .is_some_and(|manifest| manifest["supported_profile"]["pours_omitted"] == true);
+    let omitted_at_export = manifest.as_ref().is_some_and(|manifest| {
+        // `pours_omitted` is also true for a board with no pour at all.
+        let profile = &manifest["supported_profile"];
+        profile["pours_omitted"] == true
+            && profile["zone_plane_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+    });
     json!({
         "lengths": lengths.summary_json(g4_pass, &likely),
         "pours": pours_summary(shapes, outcome, omitted_at_export),
@@ -2408,8 +2416,14 @@ pub(crate) fn pours_summary(
         })
         .collect();
     let tried = shapes.contains(&Shape::Omitted);
+    // The refill step is in `completion.next_steps` only when a run won.
+    let refill_after = if winner.is_some() {
+        REFILL_AFTER_IMPORT
+    } else {
+        REFILL_WITHOUT_WINNER
+    };
     let line = if !tried && omitted_at_export {
-        format!("Pours: left out at the export (export_specctra_dsn's pours: omit). The router never saw them. {REFILL_AFTER_IMPORT}")
+        format!("Pours: left out at the export (export_specctra_dsn's pours: omit). The router never saw them. {refill_after}")
     } else if !tried {
         "Pours: none given to the router. The DSN has no plane, so every run routed without a pour. If the board should have pours, plan_pours proposes them. Add them with add_zone and refill_zones before export_specctra_dsn, then route again.".to_string()
     } else {
