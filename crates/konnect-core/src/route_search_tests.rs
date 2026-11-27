@@ -140,7 +140,7 @@ fn effort_limits_are_the_owners_budgets() {
             runs: Some(2)
         }
     );
-    for (effort, seconds) in [(Effort::M, 240), (Effort::H, 720), (Effort::Xh, 2400)] {
+    for (effort, seconds) in [(Effort::M, 240), (Effort::H, 720), (Effort::Xh, 1320)] {
         assert_eq!(
             effort.limits(),
             Limits {

@@ -3,6 +3,14 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+
+## Unreleased: effort `xh` is 22 minutes
+
+A default change, no argument change. The `xh` routing budget of `route_specctra_dsn`
+(fastroute), and so of `plan_convergent_placement`'s and `run_full_flow`'s routing calls at
+`xh`, is 1320 s (22 minutes) per board, down from 2400 s. The owner's choice (2026-11-27): on a
+40-minute search on one of his boards, the best run was found at about 20 minutes and nothing
+better came after it. `fast`, `m` and `h` are unchanged.
 ## Unreleased: `run_full_flow`, placement to routing in one tracked job (Row FF)
 
 **A new tool and two additive changes; nothing removed or renamed.**

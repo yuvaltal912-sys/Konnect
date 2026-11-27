@@ -80,7 +80,7 @@ through the registry's own handlers (decision FF1).**
 
 | Option | For | Against |
 |---|---|---|
-| One synchronous tool | One call | Cannot finish under the MCP client's limit. The routing alone takes 4 to 40 minutes, and a placement run on one of the owner's boards has outlasted the client's 30 minutes (Row AP2). |
+| One synchronous tool | One call | Cannot finish under the MCP client's limit. The routing alone takes 4 to 22 minutes, and a placement run on one of the owner's boards has outlasted the client's 30 minutes (Row AP2). |
 | A planner that returns one ordered batch of steps | Follows Q1, Row PS decision 1, Row CT and Row ZR decision 4 to the letter: the planner writes nothing | The AI still makes 10 or more live calls. Each one can hit an IPC drop. Nothing records where the flow stopped, and the approvals stay spread over many turns. That is the pain itself. |
 | **A tracked job, legs between gates** | One start call. One answer for the approvals. It survives IPC drops and server restarts through its record. It reuses D's module. The same handlers mean the same guards. | It writes the live board itself, at the approved points. That amends "the planner never writes" for this one tool: owner decision 1. |
 
@@ -414,7 +414,7 @@ the flow folder, and the response names them.
 | P2 and P4, each | under a minute to a few minutes | KiCad's refill and DRC with and without the proposals, up to two fills (PP16) |
 | P3, the placement search | 10 to over 30 minutes | Row CT: 729 s on the public fixture at `m`; over 30 minutes on one of the owner's boards at `h` (Row AP2) |
 | L2 to L4 | about a minute | IPC writes, refills, verified saves |
-| R1 to R3 | the effort's budget plus the judge: `m` 240 s, `h` 720 s, `xh` 2,400 s, each with several minutes of judging and pruning | Row BN |
+| R1 to R3 | the effort's budget plus the judge: `m` 240 s, `h` 720 s, `xh` 1,320 s, each with several minutes of judging and pruning | Row BN |
 | F1 to F4 | a few minutes | the apply's candidate DRC, refills, stitching rounds |
 
 - **Every call stays within D's limits.** A start or answer call returns once its leg has
