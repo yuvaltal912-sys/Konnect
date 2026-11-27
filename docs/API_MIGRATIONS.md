@@ -3,6 +3,47 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `plan_convergent_placement` runs in the background
+
+**A behaviour change.** A call with `board` no longer waits for the plan. It answers
+at once with `status: started`, a `run_id`, `board`, `effort`, `planned_from`,
+`records` (the run folder) and `next_steps`. Before, a run at effort h could outlast
+the MCP client's time limit (the client gives up after about 1,800 s), and its
+result was lost.
+
+- **New arguments:** `run_id` (report a run) and `wait_s` (with `run_id` only: wait
+  up to 0 to 600 s for the run to end; default 0). `board` is no longer required: a
+  call gives either `board` (with `effort` and `fastroute_path`) or `run_id` (with
+  `wait_s`), and any mix is refused.
+- **A running run** answers `status: running` with `run_id`, `board`, `elapsed_s`,
+  `phase` (`starting`, `generating`, `converging`, `routing`, `writing`),
+  `candidates` (`generated` of `generate_total`, `converge_runs`, `to_route`,
+  `judged`, `routed`), `effort_level_reached` (family C's effort level),
+  `routing_effort`, `records` and `next_steps`. A run of another Konnect process adds
+  `served_by_pid` and `progress_as_of`; its progress is the last one it wrote (every
+  10 s). `converge_runs` also counts the starts a stop rule discarded, so it can end
+  above the result's `search.converge_runs`.
+- **A finished run** answers the whole result as before (`status` `planned`,
+  `planned_with_gate_failures`, `no_candidate` or `not_routed`, `apply_with`,
+  `winner.moves`, `winner.change`, ...) plus `run_id`. It is kept in the run folder
+  (`result.json`, beside `run.json`, the run's record), so the same call reads it
+  after a server restart, as long as the folder exists.
+- **Errors:** a failed run is an error result with `status: failed`, `error`,
+  `run_id`, `board`, `records` and `next_steps`; a run whose server stopped before it
+  ended is the same with `status: interrupted`. A second start on a board with a run
+  is refused, before KiCad is read, and names the running `run_id`. An unknown or
+  malformed `run_id` is an argument error. A report call needs neither KiCad nor the
+  board open.
+- **No synchronous mode** and no cancel call: no caller needs either. A board's run
+  ends by its own stop rules. A server that ends (its stdio closed or failed, or a
+  reload) stops its runs first and starts no new one, so their router processes are
+  killed rather than left running; such a run reads `status: failed` with `error`
+  saying the server stopped. A signal that kills the server (SIGTERM, SIGKILL) skips
+  that, as before this change: Konnect installs no signal handler, and an HTTP-only
+  server ends only so. Its run then reads `status: interrupted`.
+- **Migration:** after a start, call again with `{"run_id": ..., "wait_s": 300}`
+  until `status` is not `running`, then read the result as before.
+
 ## Unreleased: the route and placement results say what they did not check
 
 Additive only: no argument changes, nothing removed or renamed, `status` unchanged.
