@@ -360,6 +360,9 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - **A preview takes no checkpoint** (`board_safety::previews_only`). Only `dry_run` exactly `false` deletes: the handler defaults a missing `dry_run` to true and refuses one that is not a boolean, so every other value changes nothing.
 - **An apply with a stale `expected_plan_revision` still gets the checkpoint first.** The revision is checked inside the tool, after the guard; checking it twice would read the board twice. The checkpoint is harmless (the next apply reuses it while the files are the same), and the note says no change to the board is known.
 - **As a live-only tool**, it takes no checkpoint where KiCad does not hold the board or cannot be seen to hold it: it refuses on its own there, as `apply_specctra_ses` does.
+- **The checkpoint comes before the tool's argument checks**, as for the other two: an apply without `expected_plan_revision` on a project that cannot be checkpointed reports the checkpoint first. Moving argument checks into the guard would duplicate the handler's.
+- **A `noop` result offers no Undo** (`Outcome::Unchanged`, review finding 1). An apply on a board with no routing changes nothing, and an Undo would revert the user's own last edit in KiCad. It reads `status: "noop"` in the JSON body, so it holds for every tool on the list.
+- **Limits are now limits of this tool.** A project over the checkpoint limits (256 MB, 4096 files) can no longer take the apply until it is trimmed; before, it could. Named in `API_MIGRATIONS.md`.
 
 **Verified:** filled in after the final gate.
 

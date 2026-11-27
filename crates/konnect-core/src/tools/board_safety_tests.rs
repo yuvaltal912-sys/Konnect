@@ -1009,10 +1009,17 @@ fn fake_delete_all_routing(calls: Arc<AtomicUsize>) -> ToolDef {
 }
 
 /// A preview of `delete_all_routing` (no `dry_run`, or `dry_run: true`) runs
-/// the tool and takes no checkpoint; its result carries no note.
+/// the tool and takes no checkpoint; its result carries no note. So does a
+/// `dry_run` that is not a boolean, which the tool refuses: only `false` deletes.
 #[tokio::test]
 async fn a_delete_all_routing_preview_takes_no_checkpoint() {
-    for args in [json!({}), json!({ "dry_run": true })] {
+    for args in [
+        json!({}),
+        json!({ "dry_run": true }),
+        json!({ "dry_run": "false" }),
+        json!({ "dry_run": null }),
+        json!({ "dry_run": 0 }),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let (_, board) = project(dir.path());
         let server = spawn_kicad_holding(&board, BOARD_TEXT);
@@ -1131,12 +1138,77 @@ async fn the_registered_delete_all_routing_checkpoints_its_apply_only() {
         "a stale revision is refused: {:?}",
         apply.content
     );
-    assert_eq!(checkpoint_ids(dir.path()).len(), 1, "{:?}", apply.content);
-    assert!(
-        apply.content.iter().any(
-            |content| matches!(content, ToolContent::Text { text } if text.contains("live_project"))
-        ),
+    assert_eq!(
+        crate::mcp::error::extract_error_kind(&apply).as_deref(),
+        Some("stale_target"),
         "{:?}",
         apply.content
     );
+    assert!(
+        text_of(&apply).contains("Nothing was deleted"),
+        "{:?}",
+        apply.content
+    );
+    assert_eq!(checkpoint_ids(dir.path()).len(), 1, "{:?}", apply.content);
+    // The refusal's JSON body carries the note: no change known, no Undo.
+    let summary = body_of(&apply)["live_project"]["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        summary.contains("no change to the board is known"),
+        "{:?}",
+        apply.content
+    );
+    assert!(!summary.contains("Undo"), "{summary}");
+}
+
+/// An apply on a board with nothing to delete (`status: "noop"`) changed
+/// nothing: the note offers no Undo, which would revert the user's own edit.
+#[tokio::test]
+async fn a_delete_all_routing_apply_that_changed_nothing_offers_no_undo() {
+    fn noop_reply() -> CallToolResult {
+        CallToolResult::json(&json!({ "status": "noop", "dry_run": false }))
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_holding(&board, BOARD_TEXT);
+    let tool = board_safety::guard(fake_bulk_edit(
+        "delete_all_routing",
+        BoardAccess::LiveOnly,
+        Arc::new(AtomicUsize::new(0)),
+        noop_reply,
+    ));
+    let result = (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    let summary = body_of(&result)["live_project"]["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(summary.contains("changed nothing"), "{summary}");
+    assert!(!summary.contains("Undo"), "{summary}");
+    assert!(!summary.contains("edited"), "{summary}");
+}
+
+/// The apply where KiCad answers that it holds no PCB editor: the live-only
+/// tool runs to refuse on its own, and no checkpoint is taken.
+#[tokio::test]
+async fn a_delete_all_routing_apply_of_a_board_not_open_takes_no_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, board) = project(dir.path());
+    let server = spawn_kicad_answering(kiapi::common::ApiStatusCode::AsUnhandled);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = fake_delete_all_routing(calls.clone());
+    (tool.handler)(
+        &json!({ "board": board, "dry_run": false, "expected_plan_revision": "r" }),
+        arc(ctx_talking_to(server.address().to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the tool ran, to refuse");
+    assert!(checkpoint_ids(dir.path()).is_empty());
 }

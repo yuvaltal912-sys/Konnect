@@ -297,6 +297,9 @@ async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Succeeded,
+    /// A success whose JSON body says `status: "noop"`: nothing was changed (for
+    /// example `delete_all_routing` on a board with no routing).
+    Unchanged,
     /// An error that says nothing was applied, or says nothing either way.
     Failed,
     /// An error whose kind says the board may have changed.
@@ -306,7 +309,17 @@ enum Outcome {
 impl Outcome {
     fn of(result: &CallToolResult) -> Self {
         if !result.is_error {
-            return Self::Succeeded;
+            let noop = matches!(
+                result.content.first(),
+                Some(ToolContent::Text { text })
+                    if serde_json::from_str::<Value>(text)
+                        .is_ok_and(|body| body["status"] == "noop")
+            );
+            return if noop {
+                Self::Unchanged
+            } else {
+                Self::Succeeded
+            };
         }
         match crate::mcp::error::extract_error_kind(result).as_deref() {
             Some("mutation_outcome_uncertain" | "ipc_outcome_unknown") => Self::MayHaveChanged,
@@ -421,6 +434,11 @@ fn live_project_note(
         (Outcome::Failed, _) => summary.push(format!(
             "The call reported an error, and no change to the board is known to have been made. \
              {held}, in case it did."
+        )),
+        // An Undo here would undo the user's own last edit in KiCad.
+        (Outcome::Unchanged, _) => summary.push(format!(
+            "This call changed nothing (its status is noop), so there is nothing to undo. \
+             {held}, kept in case."
         )),
         (Outcome::MayHaveChanged, _) => summary.push(format!(
             "The call reported that the board may have changed: inspect it before anything else. \
