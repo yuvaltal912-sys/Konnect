@@ -113,9 +113,9 @@ async fn assert_refused_while_kicad_holds_the_board(tool: &str) {
         text_of(&result)
     );
     let why = match tool {
-        // Row RW: these two now take the live path; a KiCad that cannot list
-        // its classes, or a pattern write, still refuses, saying why.
-        "create_netclass" => "did not list its netclasses",
+        // Row RW: these two now take the live path; a KiCad that does not say
+        // which version it is, or a pattern write, still refuses, saying why.
+        "create_netclass" => "did not say which version it is",
         "assign_net_to_class" => "has no command for netclass patterns",
         _ => "currently holds this board open",
     };
@@ -205,14 +205,31 @@ mod live {
     /// message stops there; every other field only when present. Every class
     /// is listed as KiCad 10.0.1 lists it: `NCT_IMPLICIT`, itself as its one
     /// constituent.
-    #[derive(Default)]
     pub(super) struct Kicad {
+        /// What `GetVersion` answers: (major, minor, patch).
+        pub version: (u32, u32, u32),
+        /// Answer `SetNetClasses` with an error status.
+        pub refuse_writes: bool,
         pub classes: Vec<NetClass>,
         /// Answer `SetNetClasses` and apply nothing.
         pub drop_writes: bool,
         /// Whether this KiCad also has the schematic of this name open.
         pub schematic: Option<String>,
         pub set_calls: usize,
+    }
+
+    impl Default for Kicad {
+        fn default() -> Self {
+            Self {
+                // The KiCad on this Mac (2026-11-27).
+                version: (10, 0, 8),
+                refuse_writes: false,
+                classes: Vec::new(),
+                drop_writes: false,
+                schematic: None,
+                set_calls: 0,
+            }
+        }
     }
 
     fn apply(target: &mut NetClass, message: &NetClass) {
@@ -239,7 +256,7 @@ mod live {
                 into.copper_layers = stack.copper_layers.clone();
             }
             if stack.drill.is_some() {
-                into.drill = stack.drill.clone();
+                into.drill = stack.drill;
             }
         }
     }
@@ -301,8 +318,32 @@ mod live {
                     "kiapi.common.commands.NetClassesResponse",
                 )));
             }
+            if url.ends_with("GetVersion") {
+                let (major, minor, patch) = state.version;
+                return ok(Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetVersionResponse {
+                        version: Some(kiapi::common::types::KiCadVersion {
+                            major,
+                            minor,
+                            patch,
+                            full_version: format!("{major}.{minor}.{patch}"),
+                        }),
+                    },
+                    "kiapi.common.commands.GetVersionResponse",
+                )));
+            }
             if url.ends_with("SetNetClasses") {
                 state.set_calls += 1;
+                if state.refuse_writes {
+                    return kiapi::common::ApiResponse {
+                        status: Some(kiapi::common::ApiResponseStatus {
+                            status: kiapi::common::ApiStatusCode::AsBadRequest as i32,
+                            error_message: "could not unpack netclass".into(),
+                        }),
+                        header: None,
+                        message: None,
+                    };
+                }
                 let asked =
                     kiapi::common::commands::SetNetClasses::decode(command.value.as_slice())
                         .unwrap();
@@ -666,5 +707,192 @@ mod live {
             "{text}"
         );
         assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
+    }
+
+    /// The version gate: a KiCad before 10.0.7 corrupts a class written over
+    /// IPC (`netclass.cpp:223` empties its constituents), so it is refused with
+    /// nothing sent and the dialog steps given; 10.0.7 is written.
+    #[tokio::test]
+    async fn a_kicad_before_10_0_7_is_refused_and_10_0_7_is_written() {
+        for (version, written) in [
+            ((10, 0, 6), false),
+            ((10, 0, 1), false),
+            ((10, 0, 7), true),
+            ((11, 0, 0), true),
+        ] {
+            let project = project();
+            let before = std::fs::read(&project.project_file).unwrap();
+            let kicad = Arc::new(Mutex::new(Kicad {
+                classes: vec![kicad_default()],
+                version,
+                ..Default::default()
+            }));
+            let server = spawn(&project.board, kicad.clone());
+            let handler = handler_talking_to(server.address()).await;
+            let result = call(
+                &handler,
+                "create_netclass",
+                &project.board,
+                &json!({ "name": "Power", "trace_width": 0.3 }),
+            )
+            .await;
+            assert_eq!(
+                !result.is_error,
+                written,
+                "{version:?}: {}",
+                text_of(&result)
+            );
+            if written {
+                assert_eq!(kicad.lock().unwrap().set_calls, 1, "{version:?}");
+            } else {
+                let text = text_of(&result);
+                assert!(
+                    text.contains("fixed in 10.0.7")
+                        && text.contains("Board Setup > Design Rules > Net Classes"),
+                    "{text}"
+                );
+                assert_eq!(kicad.lock().unwrap().set_calls, 0, "{version:?}");
+                assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
+            }
+        }
+    }
+
+    /// A class KiCad has and the file lacks (an unsaved Board Setup edit) is
+    /// refused before anything is sent, and the other way round.
+    #[tokio::test]
+    async fn a_class_only_one_copy_has_is_refused_before_anything_is_sent() {
+        for kicad_has_it in [true, false] {
+            let project = project();
+            if !kicad_has_it {
+                let mut file = file_json(&project);
+                file["net_settings"]["classes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({ "name": "Power", "priority": -1, "clearance": 1.0 }));
+                std::fs::write(
+                    &project.project_file,
+                    format!("{}\n", serde_json::to_string_pretty(&file).unwrap()),
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&project.project_file).unwrap();
+            let mut classes = vec![kicad_default()];
+            if kicad_has_it {
+                classes.push(NetClass {
+                    name: "Power".into(),
+                    priority: Some(-1),
+                    ..Default::default()
+                });
+            }
+            let kicad = Arc::new(Mutex::new(Kicad {
+                classes,
+                ..Default::default()
+            }));
+            let server = spawn(&project.board, kicad.clone());
+            let handler = handler_talking_to(server.address()).await;
+            let result = call(
+                &handler,
+                "create_netclass",
+                &project.board,
+                &json!({ "name": "Power", "trace_width": 0.3 }),
+            )
+            .await;
+            assert!(result.is_error, "{kicad_has_it}");
+            assert!(
+                text_of(&result).contains("has not saved"),
+                "{}",
+                text_of(&result)
+            );
+            assert_eq!(kicad.lock().unwrap().set_calls, 0);
+            assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
+        }
+    }
+
+    /// KiCad refuses `SetNetClasses`: the result says the change was sent and
+    /// not confirmed, and the file is kept.
+    #[tokio::test]
+    async fn a_refused_set_net_classes_keeps_the_file() {
+        let project = project();
+        let before = std::fs::read(&project.project_file).unwrap();
+        let kicad = Arc::new(Mutex::new(Kicad {
+            classes: vec![kicad_default()],
+            refuse_writes: true,
+            ..Default::default()
+        }));
+        let server = spawn(&project.board, kicad.clone());
+        let handler = handler_talking_to(server.address()).await;
+        let result = call(
+            &handler,
+            "create_netclass",
+            &project.board,
+            &json!({ "name": "Default", "trace_width": 0.3 }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            text_of(&result).contains("did not accept SetNetClasses"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
+    }
+
+    /// The file half fails after KiCad took the change: the result says KiCad
+    /// has it, read back, and that its next save writes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_write_failing_after_kicad_took_the_change_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = project();
+        let dir = project.project_file.parent().unwrap().to_path_buf();
+        let before = std::fs::read(&project.project_file).unwrap();
+        let kicad = Arc::new(Mutex::new(Kicad {
+            classes: vec![kicad_default()],
+            ..Default::default()
+        }));
+        let server = spawn(&project.board, kicad.clone());
+        let handler = handler_talking_to(server.address()).await;
+        // Readable, not writable: the trial edit and KiCad's write go through,
+        // the file's lock and atomic replace cannot.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = call(
+            &handler,
+            "create_netclass",
+            &project.board,
+            &json!({ "name": "Default", "trace_width": 0.3 }),
+        )
+        .await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_error);
+        let text = text_of(&result);
+        assert!(
+            text.contains("now has netclass 'Default'") && text.contains("could not be written"),
+            "{text}"
+        );
+        assert_eq!(kicad.lock().unwrap().set_calls, 1);
+        assert_eq!(std::fs::read(&project.project_file).unwrap(), before);
+    }
+
+    /// A call that names no value on a class both copies have sends nothing.
+    #[tokio::test]
+    async fn a_call_that_names_nothing_sends_nothing() {
+        let project = project();
+        let kicad = Arc::new(Mutex::new(Kicad {
+            classes: vec![kicad_default()],
+            ..Default::default()
+        }));
+        let server = spawn(&project.board, kicad.clone());
+        let handler = handler_talking_to(server.address()).await;
+        let body = body(
+            &call(
+                &handler,
+                "create_netclass",
+                &project.board,
+                &json!({ "name": "Default" }),
+            )
+            .await,
+        );
+        assert_eq!(body["kicad"]["kicad_copy"], "updated");
+        assert_eq!(kicad.lock().unwrap().set_calls, 0);
     }
 }

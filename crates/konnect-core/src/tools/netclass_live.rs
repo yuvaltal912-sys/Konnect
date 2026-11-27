@@ -9,7 +9,20 @@
 //! project file as well: both copies hold it, and KiCad's next save writes the
 //! same value again.
 //!
-//! Three facts of KiCad 10.0.1 shape the messages sent:
+//! KiCad 10.0.1 to 10.0.6 must not be written this way. Their
+//! `NETCLASS::Deserialize` empties the class's constituents
+//! (`netclass.cpp:223`, `SetConstituentNetclasses( {} )`), nothing refills
+//! them, and `NETCLASS::GetName()` then reads the first element of that empty
+//! list (`netclass.cpp:328-333`). KiCad calls `GetName()` on every class when it
+//! saves the project (`net_settings.cpp:76`), so the next save after such a
+//! write reads past an empty vector. KiCad 10.0.7 fixed it (its `Deserialize`
+//! sets `{ this }`, and `Serialize` marks a class explicit when it has at most
+//! one constituent); 10.0.6 has neither change. So the live write needs a KiCad
+//! of at least [`FIXED_IN`], read with `GetVersion`; an older one is refused
+//! with the steps in KiCad's own dialog.
+//!
+//! Three facts of KiCad 10.0.1 shape the messages sent (they hold on 10.0.7
+//! and 10.0.8 too):
 //! - `NETCLASS::Serialize` marks every class `NCT_IMPLICIT` (its constructor
 //!   puts the class in its own constituents, `netclass.cpp:56-59` and `:142`),
 //!   and `NETCLASS::Deserialize` returns early on `NCT_IMPLICIT` after setting
@@ -33,6 +46,20 @@ use konnect_ipc::gen::kiapi;
 use konnect_ipc::gen::kiapi::common::project::{NetClass, NetClassBoardSettings, NetClassType};
 use serde_json::{json, Value};
 use std::path::Path;
+
+/// The first KiCad whose `SetNetClasses` leaves a class it can save (module
+/// docs): (major, minor, patch).
+pub(crate) const FIXED_IN: (u32, u32, u32) = (10, 0, 7);
+
+/// The steps that make a netclass change in KiCad itself, for every refusal
+/// that leaves the change to the user.
+pub(crate) fn dialog_steps(name: &str) -> String {
+    format!(
+        "In KiCad: File > Board Setup > Design Rules > Net Classes, set the values of '{name}' \
+         in its row (add the row if it is new), press OK, then File > Save. Then call \
+         get_netclasses: 'kicad_unsaved' is empty once the file has KiCad's values."
+    )
+}
 
 /// The netclass settings this module reads and writes, by the key KiCad's
 /// project file uses for them.
@@ -272,6 +299,18 @@ pub(crate) fn unsaved_differences(kicad: &[NetClass], file_classes: &[Value]) ->
             out.push(json!({ "netclass": class.name, "only_in": "kicad" }));
             continue;
         };
+        // The priority decides which class wins a net; compared where the file
+        // writes one (KiCad always does, and so does create_netclass).
+        if let Some(written) = saved.get("priority").and_then(Value::as_i64) {
+            if class.priority.map(i64::from) != Some(written) {
+                out.push(json!({
+                    "netclass": class.name,
+                    "field": "priority",
+                    "kicad": class.priority,
+                    "project_file": written,
+                }));
+            }
+        }
         for field in ALL_FIELDS {
             let held = field.get(class);
             let written = saved.get(field.key()).and_then(Value::as_f64).map(mm_to_nm);
@@ -298,10 +337,11 @@ pub(crate) fn unsaved_differences(kicad: &[NetClass], file_classes: &[Value]) ->
 pub(crate) fn unsaved_note(differences: &[Value]) -> Option<String> {
     (!differences.is_empty()).then(|| {
         format!(
-            "KiCad holds {} netclass setting(s) its project file does not have yet \
-             (`kicad_unsaved`). Routing and every saved-file reader use the file: \
-             save the board in KiCad (File > Save, or run_drc with sync_live_board=true) \
-             before routing.",
+            "KiCad's copy of the project and its project file differ in {} netclass \
+             setting(s) (`kicad_unsaved`). Routing reads the file, and KiCad's next save \
+             writes its own copy over the file. If KiCad's values are the ones you want, \
+             save the board in KiCad before routing (File > Save); if the file's are, set \
+             them again with create_netclass.",
             differences.len()
         )
     })
@@ -316,7 +356,7 @@ pub(crate) struct Written {
 }
 
 /// The outcome of offering a netclass write to a KiCad that may hold the board.
-pub(crate) enum Held {
+pub(crate) enum LiveWrite {
     /// No KiCad holds this board: the file is the only copy.
     NotHeld,
     /// KiCad holds it, and its copy now has the change, read back.
@@ -349,7 +389,8 @@ pub(crate) async fn write_if_held(
     named: Vec<(Field, i64)>,
     new_defaults: Vec<(Field, i64)>,
     schematic_locked: bool,
-) -> anyhow::Result<Held> {
+    file_has_class: bool,
+) -> anyhow::Result<LiveWrite> {
     let class_name = name.to_string();
     let schematic_name = board
         .with_extension("kicad_sch")
@@ -363,19 +404,21 @@ pub(crate) async fn write_if_held(
             &named,
             &new_defaults,
             schematic_locked.then_some(schematic_name.as_str()),
+            file_has_class,
         ))
     })
     .await?;
     match observed {
-        LiveBoard::Answered(Ok(written)) => Ok(Held::Written(written)),
+        LiveBoard::Answered(Ok(written)) => Ok(LiveWrite::Written(written)),
         LiveBoard::Answered(Err(LiveFailure::Before(reason))) => {
-            Ok(Held::Refused(CallToolResult::error(format!(
+            Ok(LiveWrite::Refused(CallToolResult::error(format!(
                 "KiCad holds this board open, and the netclass was not changed: {reason}. \
-                 Nothing was sent to KiCad and the project file was not written."
+                 Nothing was sent to KiCad and the project file was not written. {}",
+                dialog_steps(name)
             ))))
         }
         LiveBoard::Answered(Err(LiveFailure::After(reason))) => {
-            Ok(Held::Refused(CallToolResult::error(format!(
+            Ok(LiveWrite::Refused(CallToolResult::error(format!(
                 "KiCad holds this board open. The netclass change was sent to KiCad, but it \
                  could not be confirmed: {reason}. The project file was not written. Call \
                  get_netclasses to see what KiCad holds (`kicad_unsaved`) before retrying."
@@ -391,8 +434,8 @@ pub(crate) async fn write_if_held(
             )
             .await?
             {
-                None => Held::NotHeld,
-                Some(refusal) => Held::Refused(refusal),
+                None => LiveWrite::NotHeld,
+                Some(refusal) => LiveWrite::Refused(refusal),
             },
         ),
     }
@@ -404,7 +447,20 @@ fn write_live(
     named: &[(Field, i64)],
     new_defaults: &[(Field, i64)],
     schematic: Option<&str>,
+    file_has_class: bool,
 ) -> Result<Written, LiveFailure> {
+    let version = client.get_kicad_version().map_err(|e| {
+        LiveFailure::Before(format!("KiCad did not say which version it is ({e:#})"))
+    })?;
+    if (version.major, version.minor, version.patch) < FIXED_IN {
+        let (major, minor, patch) = FIXED_IN;
+        return Err(LiveFailure::Before(format!(
+            "this KiCad is {}.{}.{}, and a KiCad before {major}.{minor}.{patch} leaves a netclass \
+             written over its IPC API in a state its next save reads past the end of (fixed in \
+             {major}.{minor}.{patch}). Update KiCad, or make the change in KiCad itself",
+            version.major, version.minor, version.patch
+        )));
+    }
     if let Some(schematic) = schematic {
         let served = client
             .get_open_documents_for(konnect_ipc::types::IpcEditorKind::Schematic)
@@ -436,6 +492,26 @@ fn write_live(
         .get_net_classes()
         .map_err(|e| LiveFailure::Before(format!("KiCad did not list its netclasses ({e:#})")))?;
     let (message, existed) = class_message(&before, name, named, new_defaults);
+    // A class one copy has and the other lacks is an unsaved change in KiCad
+    // (or a file edited behind it): writing would give the two copies
+    // different values for it, and KiCad's next save would keep its own.
+    if existed != file_has_class {
+        let side = |has: bool| if has { "has it" } else { "does not" };
+        return Err(LiveFailure::Before(format!(
+            "for netclass '{name}', KiCad's copy of the project {} and the project file {}: \
+             KiCad holds a netclass change it has not saved, or the file was edited behind it. \
+             Save the board in KiCad (File > Save) and retry",
+            side(existed),
+            side(file_has_class)
+        )));
+    }
+    // Nothing named on a class both copies have: nothing to send.
+    if named.is_empty() && existed {
+        return Ok(Written {
+            after: before,
+            existed,
+        });
+    }
     client
         .merge_net_classes(vec![message.clone()])
         .map_err(|e| LiveFailure::After(format!("KiCad did not accept SetNetClasses ({e:#})")))?;
@@ -485,6 +561,7 @@ pub(crate) fn read_kicad_classes(
 pub(crate) fn live_json(written: &Written, differences: &[Value]) -> Value {
     json!({
         "kicad_copy": if written.existed { "updated" } else { "created" },
+        "board_setup_open": "If KiCad's Board Setup was open, close it with Cancel: OK writes the dialog's own copy of every netclass over this change.",
         "read_back": "kicad_netclasses_match",
         "board_nets_resync": "at_next_drc_or_save",
         "kicad_unsaved": differences,

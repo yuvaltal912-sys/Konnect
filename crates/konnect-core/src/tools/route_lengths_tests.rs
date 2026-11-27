@@ -2942,3 +2942,20 @@ fn the_not_checked_line_names_what_could_not_be_read() {
         "{no_intent}"
     );
 }
+
+/// Row RW: more rules than one call takes are split into calls of at most
+/// `MAX_RULES_PER_CALL`, each a batch of its own, every rule in exactly one.
+#[test]
+fn more_rules_than_one_call_takes_are_split_into_several_calls() {
+    let plan = LengthPlan {
+        pairs: (0..custom_rules::MAX_RULES_PER_CALL + 1)
+            .map(|i| gated(&format!("P{i}"), &format!("N{i}"), 0.05, None))
+            .collect(),
+        ..LengthPlan::default()
+    };
+    let steps = plan.next_steps(None, 0);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(steps[0].contains("call 1 of 2") && steps[1].contains("call 2 of 2"));
+    let sizes: Vec<usize> = steps.iter().map(|step| batch(step).len()).collect();
+    assert_eq!(sizes, vec![custom_rules::MAX_RULES_PER_CALL, 1]);
+}

@@ -624,8 +624,10 @@ create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?
 
 The class is written to the project's `.kicad_pro` file, which is where KiCad
 has kept netclasses since v7 — the board file is not modified. The board may stay
-open in KiCad: the change goes to KiCad's own copy first over IPC and is read
-back, then to the file (`written_to`), so KiCad's next save keeps it. KiCad's
+open in KiCad (KiCad 10.0.7 or later): the change goes to KiCad's own copy first
+over IPC and is read back, then to the file (`written_to`), so KiCad's next save
+keeps it. Ask the user to keep KiCad's Board Setup closed meanwhile: its OK writes
+the dialog's own copy of every netclass back. KiCad's
 open board applies it to its nets at its next DRC or save, so before routing
 from the live board, save in KiCad or run `run_drc` with `sync_live_board=true`.
 A width changed in KiCad's own Board Setup is not in the file until KiCad saves:

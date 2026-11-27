@@ -13,17 +13,24 @@ Additive except where named. Nothing is removed or renamed.
   `.kicad_pro`, so KiCad's next save keeps it. New result fields: `written_to`
   (`["project_file"]`, or `["kicad", "project_file"]`), `kicad` (`kicad_copy`
   `created`/`updated`, `read_back`, `board_nets_resync: at_next_drc_or_save`,
-  `kicad_unsaved`) and `warning` when KiCad holds settings its file lacks. It still
-  refuses, with nothing written, when KiCad does not list or confirm its classes, or
-  when the schematic is open in a KiCad other than the one holding the board.
+  `kicad_unsaved`, `board_setup_open`), `repaired_default_fields` when a Default was
+  completed, and `warning` when KiCad's copy and the file differ. It needs KiCad
+  10.0.7 or later: 10.0.1 to 10.0.6 leave a class written over IPC in a state their
+  next save reads past the end of (`netclass.cpp:223`, fixed in 10.0.7), so an older
+  KiCad is refused with the Board Setup steps. It also refuses, with nothing sent
+  and nothing written, when KiCad does not list its classes, when only one of the
+  two copies has the class (an unsaved change in KiCad), or when the schematic is
+  open in a KiCad other than the one holding the board. When KiCad took the change
+  but did not confirm it, or the file write failed after it, the refusal says what
+  KiCad's copy may hold, and the file is not written.
   **Changed:** `clearance`, `trace_width`, `via_drill` and `via_diameter` must be
   finite and at most 100 mm, above 0 (a clearance may be 0); before, any number was
   written.
 - **`get_netclasses`: new `kicad_unsaved`** (and `sources.kicad_unsaved`): the
   netclass settings the KiCad holding the board has in memory and its file does not
-  (`netclass`, `field`, `kicad_mm`, `project_file_mm`, or `only_in`). `null` when no
-  KiCad holding the board listed its classes. A `warning` says to save in KiCad
-  before routing when it is not empty.
+  (`netclass`, `field`, `kicad_mm`, `project_file_mm`; `field: priority` with
+  `kicad` and `project_file`; or `only_in`). `null` when no KiCad holding the board
+  listed its classes. A `warning` says which copy wins when it is not empty.
 - **`assign_net_to_class` still refuses while KiCad holds the board** (KiCad 10's
   IPC API has no netclass-pattern command); the refusal now names the steps in
   KiCad's Board Setup.
@@ -45,8 +52,8 @@ Additive except where named. Nothing is removed or renamed.
   board lock exists but KiCad did not answer.
 - **`route_specctra_dsn` (fastroute): one rules step.** With length groups or pairs
   with `max_skew_mm`, `completion.next_steps` gives one `create_custom_drc_rule`
-  call with every rule in `rules=[...]` (JSON), followed by a line for each rule that
-  needs a note; before, one line per rule.
+  call with every rule in `rules=[...]` (JSON; split into calls of at most 64 rules),
+  followed by a line for each rule that needs a note; before, one line per rule.
 
 ## Unreleased: the route and placement results say what they did not check
 

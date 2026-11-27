@@ -25,7 +25,7 @@ pub(super) fn tools() -> Vec<ToolDef> {
 }
 
 /// The most rules one call may write.
-const MAX_BATCH: usize = 64;
+const MAX_BATCH: usize = crate::custom_rules::MAX_RULES_PER_CALL;
 
 /// The rule text of the minimum shorthand, checked.
 fn shorthand_rule(name: &str, constraint: &str, minimum: f64) -> Result<String> {
@@ -541,9 +541,16 @@ async fn handle_rule_change(
         project.as_deref(),
     );
     if !dry && args["expected_plan_revision"].as_str() != Some(plan.as_str()) {
-        return Ok(CallToolResult::error(
-            "expected_plan_revision does not match; run a fresh preview",
-        ));
+        return Ok(CallToolResult::error(format!(
+            "expected_plan_revision does not match; run a fresh preview (this call checks the {} \
+             board, and the rules file, the project or whether KiCad holds the board may have \
+             changed since)",
+            if matches!(target, TargetBoard::Live(_)) {
+                "live"
+            } else {
+                "saved"
+            }
+        )));
     }
     if let Err(error) = validate(&ctx.config.kicad_cli, &proposed).await {
         return Ok(CallToolResult::error(format!(
@@ -947,6 +954,60 @@ mod tests {
             .unwrap()
             .contains("(rule \"safe\""));
         assert_eq!(std::fs::read_to_string(&board).unwrap(), "(not_a_board)");
+    }
+
+    /// A preview made while KiCad held the board does not apply once KiCad no
+    /// longer answers for it: the revision binds where the board came from.
+    #[tokio::test]
+    async fn a_live_preview_does_not_apply_after_kicad_lets_the_board_go() {
+        let d = tempfile::tempdir().unwrap();
+        let board = d.path().join("open.kicad_pcb");
+        std::fs::write(&board, FIXTURE).unwrap();
+        let live = std::str::from_utf8(FIXTURE).unwrap().to_string();
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+            &board,
+            move |command| {
+                command.type_url.ends_with("SaveDocumentToString").then(|| {
+                    konnect_ipc::builders::pack_any(
+                        &konnect_ipc::gen::kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            ..Default::default()
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    )
+                })
+            },
+        );
+        let mut ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().into());
+        ctx.config.kicad_cli = super::tests_cli::success_cli(d.path())
+            .to_string_lossy()
+            .into_owned();
+        let mut args =
+            json!({"board":board,"name":"safe","constraint":"clearance","minimum_mm":0.2});
+        let preview = handle_create_custom_drc_rule(&args, &ctx).await.unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &preview.content[0] else {
+            panic!()
+        };
+        let plan: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(plan["board_source"], "live_board");
+        // KiCad closes the board: the next call reads the saved file.
+        let mut offline = crate::tools::pcb_board::board_mock::ctx_talking_to(String::new());
+        offline.config.kicad_cli = ctx.config.kicad_cli.clone();
+        drop(server);
+        args["dry_run"] = json!(false);
+        args["expected_plan_revision"] = plan["plan_revision"].clone();
+        let result = handle_create_custom_drc_rule(&args, &offline)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!()
+        };
+        assert!(
+            text.contains("fresh preview") && text.contains("saved"),
+            "{text}"
+        );
+        assert!(!board.with_extension("kicad_dru").exists());
     }
 
     #[tokio::test]

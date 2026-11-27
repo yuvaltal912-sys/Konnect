@@ -1799,7 +1799,7 @@ async fn handle_create_netclass(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    use crate::tools::netclass_live::{self, Held};
+    use crate::tools::netclass_live::{self, LiveWrite};
     let board_path = get_path(args, "board")?;
     let name = match require_str(args, "name") {
         Ok(v) => v.to_string(),
@@ -1814,11 +1814,19 @@ async fn handle_create_netclass(
         Ok(named) => named,
         Err(refusal) => return Ok(refusal),
     };
-    // The file must exist before anything is sent to KiCad: a write KiCad took
-    // and the file then refused would leave the two copies apart.
-    if let Err(refusal) = load_project_settings(&board_path)? {
-        return Ok(refusal);
-    }
+    // The file must exist, and take the edit, before anything is sent to
+    // KiCad: a write KiCad took and the file then refused would leave the two
+    // copies apart. The edit here is a trial on a copy; nothing is saved.
+    let file_has_class = match load_project_settings(&board_path)? {
+        Err(refusal) => return Ok(refusal),
+        Ok((pro, mut trial)) => {
+            let has = trial["net_settings"]["classes"]
+                .as_array()
+                .is_some_and(|classes| classes.iter().any(|c| c["name"] == json!(name)));
+            edit_class_in_settings(&pro, &mut trial, &name, args)?;
+            has
+        }
+    };
     let new_defaults = if name == DEFAULT_CLASS_NAME {
         // KiCad always holds a Default, so this only names what a Default
         // missing from KiCad would start from; it never happens on a live board.
@@ -1841,12 +1849,13 @@ async fn handle_create_netclass(
         named,
         new_defaults,
         schematic_locked,
+        file_has_class,
     )
     .await?
     {
-        Held::NotHeld => None,
-        Held::Refused(refusal) => return Ok(refusal),
-        Held::Written(written) => Some(written),
+        LiveWrite::NotHeld => None,
+        LiveWrite::Refused(refusal) => return Ok(refusal),
+        LiveWrite::Written(written) => Some(written),
     };
     let is_default = name == DEFAULT_CLASS_NAME;
 
@@ -1878,7 +1887,7 @@ async fn handle_create_netclass(
         (pro, edit, Vec::new())
     };
 
-    let note = if edit.backfilled.is_empty() {
+    let note = if edit.backfilled.is_empty() || live.is_some() {
         if live.is_some() {
             "KiCad holds this board: its copy of the project and the project file both have \
              the change. KiCad's open board applies it to its nets at its next DRC or save; \
@@ -1909,6 +1918,9 @@ async fn handle_create_netclass(
         "file": pro.display().to_string(),
         "note": note
     });
+    if !edit.backfilled.is_empty() {
+        result["repaired_default_fields"] = json!(edit.backfilled);
+    }
     if let Some(written) = &live {
         let differences = netclass_live::unsaved_differences(&written.after, &file_classes);
         result["written_to"] = json!(["kicad", "project_file"]);

@@ -205,3 +205,16 @@ fn values_kicad_cannot_hold_are_refused() {
     assert_eq!(mm_to_nm(0.25), 250_000);
     assert_eq!(mm_to_nm(0.1 + 0.2), 300_000);
 }
+
+#[test]
+fn a_priority_the_file_writes_differently_is_named() {
+    let kicad = vec![class("Power", 3, &[])];
+    let file = vec![json!({ "name": "Power", "priority": 5 })];
+    assert_eq!(
+        unsaved_differences(&kicad, &file),
+        vec![json!({ "netclass": "Power", "field": "priority", "kicad": 3, "project_file": 5 })]
+    );
+    // The control: the same priority, or a file that writes none.
+    assert!(unsaved_differences(&kicad, &[json!({ "name": "Power", "priority": 3 })]).is_empty());
+    assert!(unsaved_differences(&kicad, &[json!({ "name": "Power" })]).is_empty());
+}

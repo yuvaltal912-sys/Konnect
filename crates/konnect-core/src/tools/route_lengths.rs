@@ -534,15 +534,28 @@ impl LengthPlan {
                 "rule": kicad_pair_rule_suggestion(pair),
             }));
         }
-        if !batch.is_empty() {
+        // One call holds at most MAX_RULES_PER_CALL rules; a longer list is
+        // split into calls of that size, each with its own preview and revision.
+        let chunks: Vec<&[Value]> = batch.chunks(custom_rules::MAX_RULES_PER_CALL).collect();
+        let calls = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
             let groups = self.groups.len();
             let pairs = self.pairs.len();
+            let which = if calls == 1 {
+                "once".to_string()
+            } else {
+                format!(
+                    "(call {} of {calls}, at most {} rules each)",
+                    index + 1,
+                    custom_rules::MAX_RULES_PER_CALL
+                )
+            };
             steps.push(format!(
                 "To keep KiCad checking these lengths after hand edits ({groups} group rule(s), {pairs} pair skew rule(s)), \
-                 once apply_specctra_ses has run call create_custom_drc_rule once with the board and rules={}: \
+                 once apply_specctra_ses has run call create_custom_drc_rule {which} with the board and rules={}: \
                  dry_run first, then apply with the plan revision it returns. Add replace_existing=true when the board already has rules of these names from an earlier route. \
                  The rules are checked by KiCad's own DRC and stay in the board when it is exported again; KiCad may hold the board open.",
-                Value::Array(batch)
+                Value::Array(chunk.to_vec())
             ));
         }
         steps.extend(notes);
