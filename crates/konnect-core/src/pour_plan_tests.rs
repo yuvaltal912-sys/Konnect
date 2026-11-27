@@ -1027,3 +1027,80 @@ fn the_bridge_never_drops_below_the_minimum_width() {
     assert_eq!(with_thermal_step(&zones, 0).unwrap(), zones.to_vec());
     assert!(with_thermal_step(&zones, 2).is_none());
 }
+
+// ─── Row FF: the roles in one argument ───────────────────────────────────────
+
+fn row_ff_roles() -> crate::tools::SupplyRoles {
+    let mut roles = crate::tools::SupplyRoles::default();
+    roles
+        .ground
+        .insert("GND".into(), "design_intent rail 'GND' at 0 V".into());
+    roles.ground.insert("AGND".into(), "name".into());
+    roles.power.insert("VCC".into(), "name".into());
+    roles.power.insert("3V3".into(), "netclass 'Power'".into());
+    roles
+}
+
+fn row_ff_nets() -> BTreeSet<String> {
+    ["GND", "AGND", "VCC", "3V3", "SIG"]
+        .iter()
+        .map(|n| n.to_string())
+        .collect()
+}
+
+#[test]
+fn rails_and_names_are_read_from_the_sources() {
+    let roles = row_ff_roles();
+    assert_eq!(
+        rails_of(&roles),
+        BTreeMap::from([("GND".to_string(), "ground")])
+    );
+    assert_eq!(named_only(&roles), ["AGND", "VCC"]);
+}
+
+#[test]
+fn with_roles_confirms_sets_and_removes() {
+    use crate::full_flow::{AsNamed, GivenRole, RolesAnswer};
+    let roles = row_ff_roles();
+    let rails = rails_of(&roles);
+    let nets = row_ff_nets();
+    assert_eq!(
+        with_roles(
+            &roles,
+            &RolesAnswer::AsNamed(AsNamed::AsNamed),
+            &rails,
+            &nets
+        )
+        .unwrap(),
+        roles
+    );
+    let given = RolesAnswer::Map(BTreeMap::from([
+        ("AGND".to_string(), GivenRole::Power),
+        ("VCC".to_string(), GivenRole::NotASupply),
+        ("SIG".to_string(), GivenRole::Ground),
+    ]));
+    let out = with_roles(&roles, &given, &rails, &nets).unwrap();
+    assert_eq!(out.power.get("AGND").map(String::as_str), Some(USER_SOURCE));
+    assert!(!out.ground.contains_key("AGND"));
+    assert!(!out.power.contains_key("VCC") && !out.ground.contains_key("VCC"));
+    assert_eq!(out.ground.get("SIG").map(String::as_str), Some(USER_SOURCE));
+    assert_eq!(named_only(&out), Vec::<String>::new());
+}
+
+#[test]
+fn with_roles_refuses_a_rail_of_another_role_and_a_missing_net() {
+    use crate::full_flow::{GivenRole, RolesAnswer};
+    let roles = row_ff_roles();
+    let rails = rails_of(&roles);
+    let nets = row_ff_nets();
+    let against = RolesAnswer::Map(BTreeMap::from([("GND".to_string(), GivenRole::Power)]));
+    assert!(with_roles(&roles, &against, &rails, &nets)
+        .unwrap_err()
+        .contains("set_design_intent"));
+    let same = RolesAnswer::Map(BTreeMap::from([("GND".to_string(), GivenRole::Ground)]));
+    assert!(with_roles(&roles, &same, &rails, &nets).is_ok());
+    let missing = RolesAnswer::Map(BTreeMap::from([("NOPE".to_string(), GivenRole::Ground)]));
+    assert!(with_roles(&roles, &missing, &rails, &nets)
+        .unwrap_err()
+        .contains("NOPE"));
+}

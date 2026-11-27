@@ -955,6 +955,92 @@ pub(crate) fn with_zones(board_text: &str, zones: &[ProposedZone]) -> Result<Str
     Ok(out)
 }
 
+// ─── Row FF: the roles in one argument ───────────────────────────────────────
+
+/// The source of a role the user gave in `pour_roles` (Row FF, FF5).
+pub(crate) const USER_SOURCE: &str = "user";
+
+/// The source a design-intent rail gives a role (`layout_quality::intent_roles`).
+const RAIL_SOURCE: &str = "design_intent rail ";
+
+/// The source a net's name gives a role.
+const NAME_SOURCE: &str = "name";
+
+/// The nets whose role comes from a design-intent rail (their source in `roles` says
+/// so), with that role: `ground` or `power`.
+pub(crate) fn rails_of(roles: &SupplyRoles) -> BTreeMap<String, &'static str> {
+    let mut rails = BTreeMap::new();
+    for (list, role) in [(&roles.ground, "ground"), (&roles.power, "power")] {
+        for (net, source) in list {
+            if source.starts_with(RAIL_SOURCE) {
+                rails.insert(net.clone(), role);
+            }
+        }
+    }
+    rails
+}
+
+/// The nets whose role comes from their name only, in name order.
+pub(crate) fn named_only(roles: &SupplyRoles) -> Vec<String> {
+    let mut nets: Vec<String> = roles
+        .ground
+        .iter()
+        .chain(roles.power.iter())
+        .filter(|(_, source)| source.as_str() == NAME_SOURCE)
+        .map(|(net, _)| net.clone())
+        .collect();
+    nets.sort();
+    nets.dedup();
+    nets
+}
+
+/// The roles of `roles`, with each net of `given` set to its role and its source
+/// [`USER_SOURCE`]. `NotASupply` removes the net from both lists. `"as_named"` confirms
+/// every role as it is. A net of `given` that is a design-intent rail (`rails`) of
+/// another role is an error naming the rail: the intent wins. A net that `nets` does not
+/// hold is an error too.
+pub(crate) fn with_roles(
+    roles: &SupplyRoles,
+    given: &crate::full_flow::RolesAnswer,
+    rails: &BTreeMap<String, &'static str>,
+    nets: &BTreeSet<String>,
+) -> std::result::Result<SupplyRoles, String> {
+    use crate::full_flow::{GivenRole, RolesAnswer};
+    let RolesAnswer::Map(given) = given else {
+        return Ok(roles.clone());
+    };
+    let mut out = roles.clone();
+    for (net, role) in given {
+        if !nets.contains(net) {
+            return Err(format!(
+                "pour_roles names '{net}', which has no pad on the board. Name only the board's nets."
+            ));
+        }
+        if let Some(rail) = rails.get(net) {
+            if *rail != role.name() {
+                return Err(format!(
+                    "pour_roles gives '{net}' the role {}, but the design intent records it as a \
+                     {rail} rail, and the design intent wins. Change pour_roles, or edit the rail \
+                     with set_design_intent (section 'rails').",
+                    role.name()
+                ));
+            }
+        }
+        out.ground.remove(net);
+        out.power.remove(net);
+        match role {
+            GivenRole::Ground => {
+                out.ground.insert(net.clone(), USER_SOURCE.to_string());
+            }
+            GivenRole::Power => {
+                out.power.insert(net.clone(), USER_SOURCE.to_string());
+            }
+            GivenRole::NotASupply => {}
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[path = "pour_plan_tests.rs"]
 pub(crate) mod tests;

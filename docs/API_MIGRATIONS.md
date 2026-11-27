@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `run_full_flow`, placement to routing in one tracked job (Row FF)
+
+**A new tool and two additive changes; nothing removed or renamed.**
+
+- `run_full_flow` (toolset `integration`, live KiCad only): one tracked job on the job
+  module. Forms: start (`board`, optional `effort`, `placement_effort`,
+  `fastroute_path`, `steps`, `approve`), report (`run_id`, `wait_s` 0 to 600), answer
+  (`run_id`, `answer`, `expected_plan_revision`), resume (`run_id`, `resume: true`)
+  and abandon (`run_id`, `abandon: true`). A mix of two forms is refused. Its record is
+  `<state>/full-flow/<run_id>/flow.json`; its legs are runs of kind `full-flow-legs`.
+- `plan_pours` takes `pour_roles`: `"as_named"`, or a map of net to `ground`, `power`
+  or `not_a_supply`. A net it names has the source `user` in `nets`. A role against a
+  design-intent rail, or a net with no pad, is refused. Without it nothing changes.
+- `route_specctra_dsn` (fastroute): the next step that gives the length rules keeps its
+  `manual` line and now also carries `tool: "create_custom_drc_rule"` and `arguments:
+  {board, rules, replace_existing: true}`, so a caller can run it without reading the
+  prose. `plan_convergent_placement` refuses a board that has an open full flow.
 ## Unreleased: `delete_all_routing`'s apply checkpoints first (Row BS, follow-up)
 
 **Additive.** `delete_all_routing` with `dry_run: false` now gets the automatic

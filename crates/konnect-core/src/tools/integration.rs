@@ -39,23 +39,8 @@ const JLCPCB_MAX_DATABASE_BYTES: u64 = 8_589_934_592;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
-/// `tool!` for a handler that takes the shared `Arc<ToolContext>` instead of
-/// `&ToolContext`: the fastroute engine of `route_specctra_dsn` calls other
-/// tools' handlers through it. The name ends in `tool` so that
-/// `schema_parameter_usage` finds this registration as it finds a `tool!` one.
-macro_rules! arc_tool {
-    ($name:expr, $desc:expr, $schema:expr, $handler:expr) => {{
-        let h: crate::tools::ToolHandlerFn = std::sync::Arc::new(move |args, ctx| {
-            let args = args.clone();
-            let ctx = ctx.clone();
-            Box::pin(async move { ($handler)(&args, ctx).await })
-        });
-        crate::tools::ToolDef::new($name, $desc, $schema, h)
-    }};
-}
-
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "download_jlcpcb_database",
             "Download or update the local JLCPCB component parts database cache (SQLite).",
@@ -221,7 +206,10 @@ pub fn tools() -> Vec<ToolDef> {
         // A downloaded part's KiCad files, copied into a project library. Its
         // code lives with the library tools (`library_part_import.rs`).
         super::library::part_import_tool(),
-    ]
+    ];
+    // Row FF: one tracked job from placement through pours to routing.
+    tools.extend(super::full_flow_tool::tools());
+    tools
 }
 
 /// Freerouting's automatic neck-down narrows tracks below their class, which

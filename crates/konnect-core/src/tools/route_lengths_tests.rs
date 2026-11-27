@@ -2959,3 +2959,39 @@ fn more_rules_than_one_call_takes_are_split_into_several_calls() {
     let sizes: Vec<usize> = steps.iter().map(|step| batch(step).len()).collect();
     assert_eq!(sizes, vec![custom_rules::MAX_RULES_PER_CALL, 1]);
 }
+
+/// Row FF: each `create_custom_drc_rule` line carries the rules of its call, exactly
+/// the batch its text gives; every other line carries none.
+#[test]
+fn each_rule_line_carries_its_batch_in_structured_form() {
+    let plan = LengthPlan {
+        pairs: (0..custom_rules::MAX_RULES_PER_CALL + 1)
+            .map(|i| gated(&format!("P{i}"), &format!("N{i}"), 0.05, None))
+            .collect(),
+        ..LengthPlan::default()
+    };
+    let entries = plan.next_step_entries(Some(&measures(1.0, &[])), 1);
+    let lines: Vec<String> = entries.iter().map(|(line, _)| line.clone()).collect();
+    assert_eq!(lines, plan.next_steps(Some(&measures(1.0, &[])), 1));
+    let mut batches = 0;
+    for (line, rules) in &entries {
+        if line.contains("call create_custom_drc_rule") {
+            let rules: Vec<(String, String)> = rules
+                .as_ref()
+                .expect("a rule line has its rules")
+                .iter()
+                .map(|rule| {
+                    (
+                        rule["name"].as_str().unwrap().to_string(),
+                        rule["rule"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(rules, batch(line), "{line}");
+            batches += 1;
+        } else {
+            assert!(rules.is_none(), "{line}");
+        }
+    }
+    assert_eq!(batches, 2);
+}

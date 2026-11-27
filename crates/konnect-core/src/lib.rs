@@ -5,6 +5,7 @@ pub mod design_hash;
 pub(crate) mod fastroute;
 pub(crate) mod freerouting_mcp;
 pub(crate) mod freerouting_setup;
+pub(crate) mod full_flow;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod intent_width_report;

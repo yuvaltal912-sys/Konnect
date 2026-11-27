@@ -1,5 +1,20 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+/// `tool!` for a handler that takes the shared `Arc<ToolContext>` instead of
+/// `&ToolContext`: the fastroute engine of `route_specctra_dsn` calls other
+/// tools' handlers through it. The name ends in `tool` so that
+/// `schema_parameter_usage` finds this registration as it finds a `tool!` one.
+macro_rules! arc_tool {
+    ($name:expr, $desc:expr, $schema:expr, $handler:expr) => {{
+        let h: crate::tools::ToolHandlerFn = std::sync::Arc::new(move |args, ctx| {
+            let args = args.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ($handler)(&args, ctx).await })
+        });
+        crate::tools::ToolDef::new($name, $desc, $schema, h)
+    }};
+}
+
 #[cfg(test)]
 mod board_extents_tests;
 pub mod board_geometry;
@@ -44,6 +59,7 @@ mod layout_quality;
 pub(crate) use layout_quality::{
     pads_off_main_group, pads_unreached_by_fill, supply_roles, SupplyRoles,
 };
+pub(crate) mod full_flow_tool;
 mod lcsc_packages;
 pub mod library;
 mod library_footprint;

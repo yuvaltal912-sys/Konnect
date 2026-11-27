@@ -573,7 +573,7 @@ fn kicad_board_lock_reason(error: &anyhow::Error) -> &'static str {
 /// A JSON `null` counts as absent: `{"query": null}` is a caller who has not
 /// supplied a query, and every `as_str()`/`as_array()` read would treat it the
 /// same way.
-fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
+pub(crate) fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
     schema
         .get("required")?
         .as_array()?
@@ -1779,7 +1779,7 @@ fn schema_validation_error(error: &jsonschema::ValidationError<'_>) -> (String, 
     (field, error.to_string())
 }
 
-fn schema_argument_error(
+pub(crate) fn schema_argument_error(
     error: &jsonschema::ValidationError<'_>,
 ) -> (CallToolResult, CallStatus, Option<String>) {
     let (field, reason) = schema_validation_error(error);
@@ -1796,7 +1796,7 @@ fn schema_argument_error(
     )
 }
 
-fn call_status(result: &CallToolResult) -> CallStatus {
+pub(crate) fn call_status(result: &CallToolResult) -> CallStatus {
     match crate::outcome::status(result) {
         Some(OutcomeStatus::Complete) => CallStatus::Ok,
         Some(OutcomeStatus::Partial) => CallStatus::Partial,

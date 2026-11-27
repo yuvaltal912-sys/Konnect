@@ -2255,14 +2255,25 @@ pub(crate) fn result_json(
             }
         }
     }
-    let length_steps = lengths.next_steps(
+    let length_steps = lengths.next_step_entries(
         winner_lengths,
         crate::length_probe::kicad_rule_violations(&judged.measures.violations),
     );
+    let rules_board = crate::specctra::manifest_beside(dsn)
+        .as_ref()
+        .and_then(|manifest| manifest["board_path"].as_str().map(PathBuf::from));
     if let Some(steps) = result["completion"]["next_steps"].as_array_mut() {
-        for line in length_steps {
+        for (line, rules) in length_steps {
             let number = steps.len() + 1;
-            steps.push(json!({ "step": number, "manual": line }));
+            let mut step = json!({ "step": number, "manual": line });
+            // Row FF: the rules call in its structured form beside the line, so a caller
+            // (run_full_flow) runs it without reading the prose.
+            if let (Some(rules), Some(board)) = (rules, &rules_board) {
+                step["tool"] = json!("create_custom_drc_rule");
+                step["arguments"] =
+                    json!({ "board": board, "rules": rules, "replace_existing": true });
+            }
+            steps.push(step);
         }
     }
     // What the call checked and how it gave the pours, in plain lines; a check

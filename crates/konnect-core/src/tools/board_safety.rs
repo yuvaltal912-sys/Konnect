@@ -215,7 +215,7 @@ pub(crate) fn guard(mut tool: ToolDef) -> ToolDef {
 
 /// Whether KiCad held the board just before the bulk edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
+pub(crate) enum Held {
     /// KiCad named this exact board as open.
     Open,
     /// KiCad answered, and the board is not among its open boards (`NotOpen`), or
@@ -243,14 +243,14 @@ impl Held {
 
 /// What Konnect saw of the board just before the bulk edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Liveness {
-    held: Held,
+pub(crate) struct Liveness {
+    pub(crate) held: Held,
     /// The live board differs from its saved file (by the canonical tree, the
     /// identity the route judge uses); `None` when that could not be read.
-    unsaved: Option<bool>,
+    pub(crate) unsaved: Option<bool>,
 }
 
-async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
+pub(crate) async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
     let observed = live_board::observe(ctx, board, |client, document| {
         Ok(client.save_document_to_string_in(document).ok())
     })
@@ -295,7 +295,7 @@ async fn liveness(ctx: &ToolContext, board: &Path) -> anyhow::Result<Liveness> {
 
 /// How the wrapped call ended, as far as its result says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+pub(crate) enum Outcome {
     Succeeded,
     /// A success whose JSON body says `status: "noop"`: nothing was changed (for
     /// example `delete_all_routing` on a board with no routing).
@@ -307,7 +307,7 @@ enum Outcome {
 }
 
 impl Outcome {
-    fn of(result: &CallToolResult) -> Self {
+    pub(crate) fn of(result: &CallToolResult) -> Self {
         if !result.is_error {
             let noop = matches!(
                 result.content.first(),

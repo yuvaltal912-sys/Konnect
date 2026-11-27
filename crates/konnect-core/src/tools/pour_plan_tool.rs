@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// The words of the next step that asks to confirm the roles that come from names.
+const CONFIRM_ROLES: &str = "Confirm them";
+
 /// The `sources` word for what kicad-cli measured on a scratch copy.
 pub(crate) const FROM_KICAD_CLI: &str = "kicad_cli";
 
@@ -77,12 +80,17 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          nothing_to_propose. Show the user the plan and call add_zone once per proposal \
          only on their OK, then refill_zones and save_project. Add the zones before \
          export_specctra_dsn or after the routed session is imported, never between the \
-         two: the import checks the board against what was exported.",
+         two: the import checks the board against what was exported. `pour_roles` \
+         confirms or sets the roles in the same call: \"as_named\" confirms every role \
+         that comes from a net's name, and a map of net to ground, power or not_a_supply \
+         sets the nets it names (their source reads `user`); nothing is saved, and a role \
+         against a design-intent rail is refused.",
         json!({
             "type": "object",
             "properties": {
                 "board": { "type": "string", "description": "Path to the .kicad_pcb file" },
-                "board_source": board_source::board_source_schema()
+                "board_source": board_source::board_source_schema(),
+                "pour_roles": pour_roles_schema()
             },
             "required": ["board"]
         }),
@@ -129,7 +137,43 @@ async fn handle_plan_pours(args: &Value, ctx: &ToolContext) -> anyhow::Result<Ca
         Ok(source) => source,
         Err(refusal) => return Ok(refusal),
     };
-    plan_pours_in(ctx, &board, source, None).await
+    let given = match read_pour_roles(args) {
+        Ok(given) => given,
+        Err(refusal) => return Ok(refusal),
+    };
+    plan_pours_in(ctx, &board, source, None, given.as_ref()).await
+}
+
+/// `pour_roles`'s schema (Row FF, FF5): `"as_named"`, or a map of net to role. Shared by
+/// `plan_pours` and `run_full_flow`.
+pub(crate) fn pour_roles_schema() -> Value {
+    json!({
+        "description": "Confirms or sets the roles of the board's supply nets for this call only (nothing is saved). \"as_named\" confirms every role that comes from a net's name; a map {net: \"ground\" | \"power\" | \"not_a_supply\"} sets the nets it names. A role against a design-intent rail is refused: edit the rail with set_design_intent.",
+        "oneOf": [
+            { "type": "string", "enum": ["as_named"] },
+            {
+                "type": "object",
+                "additionalProperties": { "type": "string", "enum": ["ground", "power", "not_a_supply"] }
+            }
+        ]
+    })
+}
+
+/// `pour_roles` of `args`, or the refusal of a value that is not one.
+pub(crate) fn read_pour_roles(
+    args: &Value,
+) -> Result<Option<crate::full_flow::RolesAnswer>, CallToolResult> {
+    match args.get("pour_roles") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| {
+                invalid_arg(
+                "pour_roles",
+                "must be \"as_named\" or a map of net to \"ground\", \"power\" or \"not_a_supply\"",
+            )
+            }),
+    }
 }
 
 /// Steps 2 to 7 of [`handle_plan_pours`]. `state` is Konnect's state folder, `None` for
@@ -140,25 +184,84 @@ async fn plan_pours_in(
     board: &Path,
     source: BoardSource,
     state: Option<&Path>,
+    given: Option<&crate::full_flow::RolesAnswer>,
 ) -> anyhow::Result<CallToolResult> {
-    let board = board.to_path_buf();
-    // 2. The board, 3. the files beside it.
-    let read = match board_text(ctx, &board, source).await? {
+    // 2. The board.
+    let read = match board_text(ctx, board, source).await? {
         Ok(read) => read,
         Err(refusal) => return Ok(refusal),
     };
+    Ok(plan_read(ctx, board, read, given, state).await?.0)
+}
+
+/// Row FF: `plan_pours`'s steps 3 to 7 on a given board text (`text`, a scratch copy's,
+/// planned as `board`: the sidecars are `board`'s, and the `add_zone` arguments name
+/// it), with the roles `given` applied as `pour_roles` applies them. The result is the
+/// tool's, unchanged, beside the final plan: the proposals after PP16's thermal step and
+/// `withdraw_unfilled`, the ones whose `add_zone` arguments the result carries; `None`
+/// when the result is an error (nothing planned, or the check failed).
+pub(crate) async fn plan_text(
+    ctx: &ToolContext,
+    board: &Path,
+    text: &str,
+    given: Option<&crate::full_flow::RolesAnswer>,
+    state: Option<&Path>,
+) -> anyhow::Result<(CallToolResult, Option<PourPlan>)> {
+    let read = BoardText {
+        text: text.to_string(),
+        from: FROM_FULL_FLOW,
+        evidence: json!({ "kind": "full_flow_scratch", "planned_as": board.display().to_string() }),
+    };
+    plan_read(ctx, board, read, given, state).await
+}
+
+/// The `sources.board` word for a text `run_full_flow` planned on a scratch copy.
+pub(crate) const FROM_FULL_FLOW: &str = "full_flow_scratch";
+
+/// The supply roles of `text` as `plan_pours` resolves them (the nets that have a pad,
+/// the design intent and the project file beside `board`), with the nets: what
+/// `run_full_flow`'s pre-flight reads (Row FF, gate R). `Err` is the refusal.
+pub(crate) fn board_roles(
+    board: &Path,
+    text: &str,
+) -> Result<(BTreeSet<String>, crate::tools::SupplyRoles), CallToolResult> {
+    let sidecars = sidecars(board)?;
+    let facts = crate::pour_plan::board_facts(text).map_err(|error| {
+        CallToolResult::error(format!(
+            "The board cannot be planned: {error:#}. Pours are defined before the Specctra \
+             export, and the export refuses this board too. Nothing was started."
+        ))
+    })?;
+    let nets: BTreeSet<String> = facts.pads.keys().cloned().collect();
+    let intent_text = sidecars.intent.as_ref().map(|(_, text)| text.as_str());
+    let roles = crate::tools::supply_roles(&nets, intent_text, sidecars.project_text.as_deref());
+    Ok((nets, roles))
+}
+
+/// Steps 3 to 7 of the handler on `read`.
+async fn plan_read(
+    ctx: &ToolContext,
+    board: &Path,
+    read: BoardText,
+    given: Option<&crate::full_flow::RolesAnswer>,
+    state: Option<&Path>,
+) -> anyhow::Result<(CallToolResult, Option<PourPlan>)> {
+    let board = board.to_path_buf();
+    // 3. The files beside it.
     let sidecars = match sidecars(&board) {
         Ok(sidecars) => sidecars,
-        Err(refusal) => return Ok(refusal),
+        Err(refusal) => return Ok((refusal, None)),
     };
 
     // 4. The plan, off the async threads.
     let text = read.text.clone();
     let inputs = sidecars.clone();
-    let planned = tokio::task::spawn_blocking(move || plan_of(&text, &inputs)).await?;
+    let given_roles = given.cloned();
+    let planned =
+        tokio::task::spawn_blocking(move || plan_of(&text, &inputs, given_roles.as_ref())).await?;
     let mut plan = match planned {
         Ok(plan) => plan,
-        Err(message) => return Ok(CallToolResult::error(message)),
+        Err(message) => return Ok((CallToolResult::error(message), None)),
     };
     let board_sha256 = crate::place_held::sha256_hex(read.text.as_bytes());
     let mut sources = json!({ "board": read.from });
@@ -170,13 +273,14 @@ async fn plan_pours_in(
     if plan.proposals.is_empty() {
         let mut body = result_json(&board, &board_sha256, &plan, None);
         board_source::provenance(&mut body, sources, read.evidence);
-        return Ok(CallToolResult::json(&body));
+        confirmed_roles(&mut body, given);
+        return Ok((CallToolResult::json(&body), Some(plan)));
     }
 
     // 6. KiCad's fill (PP11, PP12).
     let (folder, outcome) = match run_check(ctx, &board, &read.text, &plan, state).await {
         Ok(done) => done,
-        Err(message) => return Ok(CallToolResult::error(message)),
+        Err(message) => return Ok((CallToolResult::error(message), None)),
     };
     let mut check = match outcome {
         Ok(checked) => {
@@ -185,11 +289,14 @@ async fn plan_pours_in(
             checked.check
         }
         Err(error) => {
-            return Ok(CallToolResult::error(format!(
-                "KiCad's fill of the plan failed ({error:#}). The scratch copies are in '{}'. \
-                 A plan is returned only after KiCad has filled it, so nothing is proposed.",
-                folder.display()
-            )))
+            return Ok((
+                CallToolResult::error(format!(
+                    "KiCad's fill of the plan failed ({error:#}). The scratch copies are in '{}'. \
+                     A plan is returned only after KiCad has filled it, so nothing is proposed.",
+                    folder.display()
+                )),
+                None,
+            ))
         }
     };
 
@@ -198,13 +305,36 @@ async fn plan_pours_in(
     sources["check"] = json!(FROM_KICAD_CLI);
     let mut body = result_json(&board, &board_sha256, &plan, Some((&check, &folder)));
     board_source::provenance(&mut body, sources, read.evidence);
-    Ok(CallToolResult::json(&body))
+    confirmed_roles(&mut body, given);
+    Ok((CallToolResult::json(&body), Some(plan)))
+}
+
+/// With `pour_roles` given, the next step that asks to confirm the roles from names
+/// says they were confirmed instead (Row FF, FF5).
+fn confirmed_roles(body: &mut Value, given: Option<&crate::full_flow::RolesAnswer>) {
+    if given.is_none() {
+        return;
+    }
+    if let Some(steps) = body["next_steps"].as_array_mut() {
+        for step in steps.iter_mut() {
+            if let Some(text) = step.as_str().filter(|text| text.contains(CONFIRM_ROLES)) {
+                let nets = text.split(" come from").next().unwrap_or(text).to_string();
+                *step = json!(format!(
+                    "{nets} come from their names only; pour_roles confirmed them for this call. To keep them, record the rails with set_design_intent (section 'rails')."
+                ));
+            }
+        }
+    }
 }
 
 /// Step 4 of the handler: the board's facts, the roles of its nets that have a pad, the
 /// project's rules and the plan. `Err` is the message of an error result: what to fix,
 /// and that nothing was planned.
-fn plan_of(text: &str, sidecars: &Sidecars) -> Result<PourPlan, String> {
+fn plan_of(
+    text: &str,
+    sidecars: &Sidecars,
+    given: Option<&crate::full_flow::RolesAnswer>,
+) -> Result<PourPlan, String> {
     let facts = crate::pour_plan::board_facts(text).map_err(|error| {
         format!(
             "The board cannot be planned: {error:#}. Pours are defined before the Specctra \
@@ -214,7 +344,13 @@ fn plan_of(text: &str, sidecars: &Sidecars) -> Result<PourPlan, String> {
     })?;
     let nets: BTreeSet<String> = facts.pads.keys().cloned().collect();
     let intent_text = sidecars.intent.as_ref().map(|(_, text)| text.as_str());
-    let roles = crate::tools::supply_roles(&nets, intent_text, sidecars.project_text.as_deref());
+    let mut roles =
+        crate::tools::supply_roles(&nets, intent_text, sidecars.project_text.as_deref());
+    if let Some(given) = given {
+        let rails = crate::pour_plan::rails_of(&roles);
+        roles = crate::pour_plan::with_roles(&roles, given, &rails, &nets)
+            .map_err(|reason| format!("{reason} Nothing was planned."))?;
+    }
     let rules =
         crate::pour_plan::project_rules(sidecars.project_text.as_deref()).map_err(|reason| {
             format!(
@@ -656,8 +792,10 @@ fn next_steps(plan: &PourPlan, check: Option<&FillCheck>) -> Vec<String> {
         .collect();
     if !by_name.is_empty() {
         steps.push(format!(
-            "The roles of {} come from their names only. Confirm them with the user, or record \
-             the rails with set_design_intent (section 'rails').",
+            "The roles of {} come from their names only. {CONFIRM_ROLES} with the user, then \
+             call plan_pours again with pour_roles (\"as_named\", or a map of net to ground, \
+             power or not_a_supply), or record the rails with set_design_intent (section \
+             'rails').",
             by_name.join(", ")
         ));
     }

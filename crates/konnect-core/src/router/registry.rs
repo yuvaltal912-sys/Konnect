@@ -112,9 +112,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "integration",
-        description: "JLCPCB parts database, importing a downloaded part's KiCad files into a project library, local Freerouting MCP routing, datasheet URLs",
+        description: "JLCPCB parts database, importing a downloaded part's KiCad files into a project library, local Freerouting MCP routing, datasheet URLs, and one tracked job from placement through pours to routing",
         category: "integration",
-        tool_count: 10,
+        tool_count: 11,
     },
     ToolsetMeta {
         name: "verification",

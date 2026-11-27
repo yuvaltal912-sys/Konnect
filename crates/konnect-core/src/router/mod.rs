@@ -257,7 +257,13 @@ mod tests {
                         // One section of a typed record. The handler's
                         // deny_unknown_fields model closes it and names the
                         // offending key's location, which dispatch cannot.
-                        "set_design_intent/properties/value"
+                        "set_design_intent/properties/value" |
+                        // Row FF: net name to role. The handler reads it into a
+                        // typed map whose values are closed, and checks every net
+                        // against the board.
+                        "plan_pours/properties/pour_roles/oneOf/1" |
+                        "run_full_flow/properties/approve/properties/pour_roles/oneOf/1" |
+                        "run_full_flow/properties/answer/properties/pour_roles/oneOf/1"
                     ),
                         "unreviewed open input record: {path}"
                     );
