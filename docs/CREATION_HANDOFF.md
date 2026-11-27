@@ -314,7 +314,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - **Mutants** (`cargo mutants`, `board_safety.rs` plus `ensure_checkpoint`, tests `tools::board_safety_tests::`): 37 mutants, 20 caught, 8 unviable, 9 missed. Four misses were real test gaps (the test built the sentence it checked with the function under test; nobody read the checkpoint's label); fixed, and those four are now caught. The other five sit in `ensure_checkpoint`'s one retry when the files change between scan and copy, which no test can reach without a hook into the copy; not covered. `cargo llvm-cov` not run: the controls and mutants already map each guard to a test.
 - **Review:** two rounds by an agent that did not write the code (Sonnet 5.5, effort high). Round 1: 1 must-fix (Undo offered after an error), 5 should-fix, nits. Round 2: 0 must-fix, 5 should-fix, nits. All fixed except the two nits named above.
 - **Merged in:** `fork/main` `8d03f0bb` (#125, #126, #127), docs conflicts only; every PR's rows kept.
-- **Final gate:** below, after the run.
+- **Final gate** on `78738874` (this commit adds only this line): fmt; workspace tests 6,040 passed, 0 failed, 187 ignored; sandboxed fastroute 75; doctests 9; `simulation_live` 95; clippy; deny; `fix-doc-counts` no change; release build; protected files and installed Konnect hash (`3de188bb775ab4ce`) unchanged.
 
 **Not verified.** No run against a live KiCad: the IPC answers are mock doubles. No Windows or Linux.
 
