@@ -1050,6 +1050,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Result fields of `route_specctra_dsn` (D23: differential pairs).
         "differential_pairs",
         "differential_pairs_unresolved",
+        // Result field of `route_specctra_dsn`'s `summary.lengths`.
+        "likely_pairs",
         // Design-intent fields and result fields of `route_specctra_dsn` (Row LT:
         // length matching), and the rules file's extension.
         "length_groups",
