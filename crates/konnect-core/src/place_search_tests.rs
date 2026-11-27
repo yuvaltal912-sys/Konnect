@@ -3096,3 +3096,15 @@ fn a_named_schematic_root_is_the_one_family_c_reads() {
     assert!(model.hoods.is_some());
     assert!(!written.exists(), "nothing was read beside the board");
 }
+
+#[test]
+fn a_candidate_whose_generator_panics_is_counted_as_made() {
+    let progress = SearchProgress::default();
+    let recipe = recipes(&small_matrix()).into_iter().next().unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _made = Made(&progress, &recipe);
+        panic!("a generator that panics");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(progress.snapshot().generated, 1);
+}
