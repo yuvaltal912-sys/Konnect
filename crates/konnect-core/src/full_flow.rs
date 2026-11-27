@@ -10,6 +10,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// FF4, owner decision 4: whether the placement search routes its candidates with the
+/// pours planned on the current placement (P2, `WithPours`). Measured both ways on the
+/// public placement fixture at effort m (2026-11-27): "with" lost on the pour key by one
+/// step of the ground track (entry 9: 30 against 29), though its signal was shorter and
+/// its copper quality higher. "With" was not at least as good, so the flow ships without:
+/// P2 is skipped and the candidates are routed as they are. The pours are still planned
+/// on the board the flow builds (P4).
+pub(crate) const SEARCH_WITH_POURS: bool = false;
+
 /// The most lines `summary.lines` holds.
 pub(crate) const SUMMARY_LINES: usize = 8;
 
@@ -989,6 +998,11 @@ fn skip_reason(step: Step, flow: &FlowRecord) -> Option<String> {
                 Some("steps.pours is skip".to_string())
             } else if steps.placement == RunOrSkip::Skip {
                 Some("steps.placement is skip, so no search needs the pours before it".to_string())
+            } else if !SEARCH_WITH_POURS {
+                Some(
+                    "the placement search routes its candidates without the pours (FF4, measured)"
+                        .to_string(),
+                )
             } else {
                 None
             }

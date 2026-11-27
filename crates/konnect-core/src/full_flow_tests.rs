@@ -606,8 +606,13 @@ fn everything_approved_runs_every_step_in_order() {
     });
     let (ran, skipped, end) = walk(&mut flow);
     assert_eq!(end, Next::End);
-    assert!(skipped.is_empty(), "{skipped:?}");
-    assert_eq!(ran, Step::ALL[1..].to_vec());
+    let expected: Vec<Step> = Step::ALL[1..]
+        .iter()
+        .copied()
+        .filter(|step| SEARCH_WITH_POURS || *step != Step::PoursBefore)
+        .collect();
+    assert_eq!(ran, expected);
+    assert_eq!(skipped.is_empty(), SEARCH_WITH_POURS, "{skipped:?}");
 }
 
 #[test]

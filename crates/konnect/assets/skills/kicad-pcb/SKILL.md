@@ -102,9 +102,8 @@ call `run_full_flow(run_id, wait_s: 300)` until `status` is not `running`.
 - The board must be open in KiCad's PCB editor, alone, saved, with a project
   file beside it. Set netclass widths, net classes, length groups and pair skews
   first: the flow routes at the board's rules and never invents one.
-- It plans on scratch copies before anything changes: the pours, the placement
-  search with each candidate routed with those pours, the pours on the winner,
-  and an export check of the board it would build.
+- It plans on scratch copies before anything changes: the placement search,
+  the pours on the board it would build, and an export check of that board.
 - It stops at a gate only where `approve` did not answer in advance. Gate R comes
   within seconds when a supply role comes only from a net's name (`pour_roles`).
   Gate A shows the plan: the parts that move, the routing that goes, the zones,

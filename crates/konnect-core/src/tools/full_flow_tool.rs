@@ -1,9 +1,10 @@
 //! `run_full_flow` (Row FF, `docs/FULL_FLOW_DESIGN.md`): one tracked job that takes a
 //! board from placement through pours to routing.
 //!
-//! The flow plans everything on scratch copies first (the pours on the current
-//! placement, Row CT's placement search routed with those pours, the pours again on the
-//! winner, and an export check of the board it would build), shows one plan, and on one
+//! The flow plans everything on scratch copies first (Row CT's placement search, the pours
+//! on the board it would build, and an export check of that board; the search can route
+//! its candidates with planned pours, `WithPours`, which FF4 measured and left off), shows
+//! one plan, and on one
 //! answer changes the live board one step at a time. Every write is a public tool's own
 //! handler from the registry, called as the MCP dispatcher calls it (`LiveIo`), so B's
 //! checkpoint guard, C's revision check and E's live rule writes apply exactly as they do
@@ -79,9 +80,9 @@ const ROUTE_FILE: &str = "route.json";
 const DESCRIPTION: &str = "Take a board from placement through pours to routing in one tracked job (Row FF). \
 The board must be open in KiCad's PCB editor, alone, with no unsaved changes. A start call (board, and optionally effort, \
 placement_effort, fastroute_path, steps, approve) returns at once with a run_id; a report call (run_id, wait_s up to 600) \
-gives the progress and, at the end, the whole result. The flow first plans on scratch copies: the pours on the current \
-placement (plan_pours), Row CT's placement search with each candidate routed with those pours \
-(plan_convergent_placement), the pours again on the winner, and an export check of the board it would build. Nothing on \
+gives the progress and, at the end, the whole result. The flow first plans on scratch copies: Row CT's placement search \
+(plan_convergent_placement, its candidates routed at placement_effort), the pours on the board it would build \
+(plan_pours), and an export check of that board. Nothing on \
 the board changes before the plan is shown. It stops at a gate only where approve does not answer in advance: gate R asks \
 for pour_roles within seconds when a supply role comes only from a net's name; gate A shows the plan (parts that move, \
 the old routing that goes, the zones, the roles, the export check) and asks placement, delete_routing, pours and routing; \
