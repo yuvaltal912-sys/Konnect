@@ -165,7 +165,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "effort": {
                         "type": "string",
                         "enum": ["fast", "m", "h", "xh"],
-                        "description": "fastroute only. How long the search may run per board: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 2400 s. Default: the user config key routing.effort, else m."
+                        "description": "fastroute only. How long the search may run per board: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 1320 s. Default: the user config key routing.effort, else m."
                     },
                     "fastroute_path": {
                         "type": "string",

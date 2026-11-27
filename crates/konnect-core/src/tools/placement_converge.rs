@@ -121,7 +121,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "type": "string",
                     "enum": ["fast", "m", "h", "xh"],
                     "default": "m",
-                    "description": "With board only. The routing effort of each of the three ranking calls: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 2400 s."
+                    "description": "With board only. The routing effort of each of the three ranking calls: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 1320 s."
                 },
                 "fastroute_path": {
                     "type": "string",

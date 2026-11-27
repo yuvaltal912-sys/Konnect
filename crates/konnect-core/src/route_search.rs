@@ -64,7 +64,7 @@ impl Effort {
 
     /// The owner's budgets (2026-11-16, "double the first proposal", runs in
     /// parallel): Fast = 2 runs at once and no budget; M = 240 s; H = 720 s;
-    /// XH = 2400 s, per board.
+    /// XH = 1320 s (22 min, the owner's choice of 2026-11-27; it was 2400 s), per board.
     pub(crate) fn limits(self) -> Limits {
         let minutes = |m: u64| Some(Duration::from_secs(m * 60));
         match self {
@@ -81,7 +81,7 @@ impl Effort {
                 runs: None,
             },
             Self::Xh => Limits {
-                budget: minutes(40),
+                budget: minutes(22),
                 runs: None,
             },
         }

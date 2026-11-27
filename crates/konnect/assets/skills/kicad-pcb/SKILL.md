@@ -392,7 +392,7 @@ placement orders, judges every run itself on scratch copies of the board
 1. Effort. Read `routing.effort` from the user config (`load_user_config`). If
    it is not set and the user has not chosen in this conversation, ask once:
    `fast` (2 runs at once), `m` (4 minutes), `h` (12 minutes) or `xh`
-   (40 minutes) per board. Save the answer with
+   (22 minutes) per board. Save the answer with
    `save_user_config(key_path='routing.effort', value=...)` and reuse it; ask
    before raising it. Without a choice the tool uses `m`.
 2. Export as in step 2 of the Freerouting round trip below (`save_project`,
