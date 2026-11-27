@@ -370,7 +370,7 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - **Negative controls:** 9, one break per guard (on the list, the registered tool wrapped, the preview skip, a missing `dry_run` is a preview, no checkpoint means no delete, a `noop` result seen and given no Undo, the note on a refused apply). All 9 caught, sources restored. E3 first broke a branch the stale refusal does not take (its body is JSON); it was retargeted and its test made to read the note's summary.
 - **Mutants** (`previews_only`, `Outcome::of`): 8 mutants, 7 caught, 1 unviable, 0 missed.
 - **Review:** one round, 0 must-fix, 3 should-fix (a `noop` apply advised Undo; the stale test did not check the refusal; this record was a placeholder), nits. All taken except one nit: a board path that is not a file skips the checkpoint, as for the other two tools (the tool then refuses on its own).
-- **Final gate:** below, after the run.
+- **Final gate** on `842d08f4` (this commit adds only this line): fmt; workspace tests 6,075 passed, 0 failed, 187 ignored; sandboxed fastroute 75; doctests 9; `simulation_live` 95; clippy; deny; `fix-doc-counts` no change; release build; protected files and installed Konnect hash (`3de188bb775ab4ce`) unchanged.
 
 **Not verified.** No live KiCad: the IPC answers are mock doubles. No Windows or Linux.
 
