@@ -88,9 +88,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_routing",
-        description: "Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import",
+        description: "Traces, vias, copper pours, net classes, differential pairs, deleting all routing, and strict Specctra SES import",
         category: "pcb",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "placement",
@@ -162,7 +162,11 @@ fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
             .iter()
             .map(|toolset| {
                 let tools = build_tools_for(toolset.name)
-                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name));
+                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name))
+                    .into_iter()
+                    // Row BS: the bulk edits checkpoint the project first.
+                    .map(crate::tools::board_safety::guard)
+                    .collect();
                 (toolset.name, tools)
             })
             .collect()

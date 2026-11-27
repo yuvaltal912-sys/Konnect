@@ -1883,30 +1883,67 @@ fn measures(miss_mm: f64, unmeasured: &[&str]) -> LengthMeasures {
     }
 }
 
+/// The `rules` argument a next step hands to create_custom_drc_rule (Row RW), as
+/// (name, rule) pairs, in order.
+fn batch(step: &str) -> Vec<(String, String)> {
+    let start = step
+        .find("rules=")
+        .unwrap_or_else(|| panic!("no rules batch in {step}"))
+        + "rules=".len();
+    let end = start
+        + step[start..]
+            .find(": dry_run first")
+            .expect("the batch ends");
+    let rules: Value = serde_json::from_str(&step[start..end]).expect("the batch is JSON");
+    rules
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| {
+            (
+                rule["name"].as_str().unwrap().to_string(),
+                rule["rule"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn the_next_steps_give_the_rule_of_every_checked_group_and_pair() {
+fn the_next_steps_give_every_checked_group_and_pair_in_one_batch_call() {
     let mut plan = two_group_plan();
     plan.pairs = vec![gated("DQS_P", "DQS_N", 0.05, Some("dq_low"))];
     let steps = plan.next_steps(None, 0);
-    assert_eq!(steps.len(), 3, "{steps:?}");
+    // One call for all three rules (Row RW), no line per rule; then the one
+    // note: group dq_low holds the pair, and there is no winner to pin it to.
+    assert_eq!(steps.len(), 2, "{steps:?}");
     assert!(
-        steps[0].contains("group 'dq_low' of interface 'ram'"),
+        steps[1].starts_with("Rule \"1kopper_len_ram_dq_low\"")
+            && steps[1].contains("check only the pair rules"),
         "{}",
-        steps[0]
+        steps[1]
     );
-    assert!(steps[0].contains(&suggested(&plan, 0)));
-    assert!(steps[1].contains(&suggested(&plan, 1)));
-    assert!(steps[2].contains(&kicad_pair_rule_suggestion(&plan.pairs[0])));
-    for step in &steps {
-        assert!(
-            step.contains("create_custom_drc_rule") && step.contains("apply_specctra_ses"),
-            "{step}"
-        );
-    }
-    assert!(steps[0].contains("name \"1kopper_len_ram_dq_low\""));
-    assert!(steps[2].contains("name \"1kopper_skew_/DQS_P_/DQS_N\""));
+    let step = &steps[0];
+    assert!(
+        step.contains("create_custom_drc_rule once")
+            && step.contains("apply_specctra_ses")
+            && step.contains("2 group rule(s), 1 pair skew rule(s)")
+            && step.contains("replace_existing=true"),
+        "{step}"
+    );
+    let rules = batch(step);
+    assert_eq!(
+        rules,
+        vec![
+            ("1kopper_len_ram_dq_low".to_string(), suggested(&plan, 0)),
+            (rule_names(&plan.groups)[1].clone(), suggested(&plan, 1)),
+            (
+                "1kopper_skew_/DQS_P_/DQS_N".to_string(),
+                kicad_pair_rule_suggestion(&plan.pairs[0])
+            ),
+        ]
+    );
     // Both modes are told apart.
-    assert!(steps[0].contains("constraint skew") && steps[1].contains("constraint length"));
+    assert!(rules[0].1.contains("constraint skew") && rules[1].1.contains("constraint length"));
     // A call that checks nothing has no rule to suggest, even with KiCad's own listed.
     let rules_only = LengthPlan {
         kicad_rules: vec![KicadLengthRule {
@@ -2649,23 +2686,25 @@ fn the_next_step_of_a_skew_group_with_a_pair_is_the_pinned_length_rule_beside_th
     plan.pairs = vec![gated("DQS_P", "DQS_N", 0.05, Some("dq_low"))];
     let names = rule_names(&plan.groups);
     let steps = plan.next_steps(Some(&longest_of(&plan, 0, 42.0)), 0);
-    assert_eq!(steps.len(), 3, "{steps:?}");
-    assert!(
-        steps[0].contains(&kicad_group_rule_pinned(&plan.groups[0], &names[0], 42.0)),
-        "{}",
-        steps[0]
+    // The batch, then the one rule that needs a word of its own.
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    let rules = batch(&steps[0]);
+    assert_eq!(
+        rules[0].1,
+        kicad_group_rule_pinned(&plan.groups[0], &names[0], 42.0)
     );
-    assert!(!steps[0].contains("constraint skew"), "{}", steps[0]);
+    assert!(!rules[0].1.contains("constraint skew"), "{}", rules[0].1);
     assert!(
-        steps[0].contains("pinned to the routed lengths"),
+        steps[1].contains("pinned to the routed lengths")
+            && steps[1].contains(&format!("Rule \"{}\"", names[0])),
         "{}",
-        steps[0]
+        steps[1]
     );
-    assert!(steps[0].contains("42 mm"), "{}", steps[0]);
+    assert!(steps[1].contains("42 mm"), "{}", steps[1]);
     // The pair keeps its skew rule, and the group without a pair its own rule.
-    assert!(steps[2].contains(&kicad_pair_rule_suggestion(&plan.pairs[0])));
-    assert!(steps[1].contains(&suggested(&plan, 1)));
-    assert!(!steps[1].contains("pinned"), "{}", steps[1]);
+    assert_eq!(rules[2].1, kicad_pair_rule_suggestion(&plan.pairs[0]));
+    assert_eq!(rules[1].1, suggested(&plan, 1));
+    assert!(!steps[1].contains(&names[1]), "{}", steps[1]);
 }
 
 #[test]
@@ -2675,17 +2714,18 @@ fn without_a_winner_the_skew_rule_stays_with_a_note_that_kicad_checks_only_the_p
     // No winner, or a winner that measured no longest net for the group.
     for winner in [None, Some(measures(0.0, &[]))] {
         let steps = plan.next_steps(winner.as_ref(), 0);
-        assert!(steps[0].contains(&suggested(&plan, 0)), "{}", steps[0]);
-        assert!(steps[0].contains("constraint skew"), "{}", steps[0]);
+        let rules = batch(&steps[0]);
+        assert_eq!(rules[0].1, suggested(&plan, 0));
+        assert!(rules[0].1.contains("constraint skew"), "{}", rules[0].1);
         assert!(
-            steps[0].contains("check only the pair rules"),
+            steps[1].contains("check only the pair rules"),
             "{}",
-            steps[0]
+            steps[1]
         );
         assert!(
-            !steps[0].contains("pinned to the routed lengths"),
+            !steps[1].contains("pinned to the routed lengths"),
             "{}",
-            steps[0]
+            steps[1]
         );
     }
 }
@@ -2696,23 +2736,16 @@ fn a_group_without_a_declared_pair_skew_or_in_target_mode_keeps_its_own_rule() {
     let plan = two_group_plan();
     let measured = longest_of(&plan, 0, 42.0);
     let steps = plan.next_steps(Some(&measured), 0);
-    assert!(steps[0].contains(&suggested(&plan, 0)));
-    assert!(steps[0].contains("constraint skew"));
-    assert!(
-        !steps[0].contains("pinned") && !steps[0].contains("pair rules"),
-        "{}",
-        steps[0]
-    );
+    assert_eq!(steps.len(), 1, "no note: {steps:?}");
+    let rules = batch(&steps[0]);
+    assert_eq!(rules[0].1, suggested(&plan, 0));
+    assert!(rules[0].1.contains("constraint skew"));
     // A target group that holds a pair is a length rule already: unchanged, no note.
     let mut plan = two_group_plan();
     plan.pairs = vec![gated("A0", "A1", 0.05, Some("addr"))];
     let steps = plan.next_steps(Some(&longest_of(&plan, 1, 42.0)), 0);
-    assert!(steps[1].contains(&suggested(&plan, 1)));
-    assert!(
-        !steps[1].contains("pinned") && !steps[1].contains("pair rules"),
-        "{}",
-        steps[1]
-    );
+    assert_eq!(steps.len(), 1, "no note: {steps:?}");
+    assert_eq!(batch(&steps[0])[1].1, suggested(&plan, 1));
 }
 
 #[test]
@@ -2908,4 +2941,21 @@ fn the_not_checked_line_names_what_could_not_be_read() {
         !no_intent.contains("declares no length group"),
         "{no_intent}"
     );
+}
+
+/// Row RW: more rules than one call takes are split into calls of at most
+/// `MAX_RULES_PER_CALL`, each a batch of its own, every rule in exactly one.
+#[test]
+fn more_rules_than_one_call_takes_are_split_into_several_calls() {
+    let plan = LengthPlan {
+        pairs: (0..custom_rules::MAX_RULES_PER_CALL + 1)
+            .map(|i| gated(&format!("P{i}"), &format!("N{i}"), 0.05, None))
+            .collect(),
+        ..LengthPlan::default()
+    };
+    let steps = plan.next_steps(None, 0);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(steps[0].contains("call 1 of 2") && steps[1].contains("call 2 of 2"));
+    let sizes: Vec<usize> = steps.iter().map(|step| batch(step).len()).collect();
+    assert_eq!(sizes, vec![custom_rules::MAX_RULES_PER_CALL, 1]);
 }

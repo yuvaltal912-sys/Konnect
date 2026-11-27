@@ -165,7 +165,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         arc_tool!(
             "route_specctra_dsn",
-            "Route an existing Specctra DSN and create a new SES file; an existing output is never replaced. The default engine is fastroute's best-of-N search: it routes variants of the DSN in parallel for the time `effort` allows (`fast` = 2 runs, `m` = 240 s, `h` = 720 s, `xh` = 2400 s), Konnect judges every run itself on scratch copies of the board (complete, KiCad DRC no worse than the unrouted board, track widths) and writes the best session; every level runs for its whole time (no run cap); `search` counts every outcome and lists the best runs (`search.json` in the search folder lists every run), `completion.judged` the winner's verdict, and `status` is never `complete` of either kind unless the winner passes all four gates (`incomplete` when connections stay open after the refill and stitching, else `complete_with_gate_failures`; the fourth gate checks the design intent's length groups and pair skews, and the board's own KiCad length and skew rules, as KiCad measures them: with a group or skew declared, `length_matching` says what was tuned, measured and not checked, and the next steps give KiCad rules that keep checking it). When every gate passes and the judge added no stitching via, `status` is the judge's, not the router's count (which takes a connection a pour makes for one it left); `completion.router_unrouted` keeps the count. When the winner passes every gate and the judge added no stitching, the ground vias its filled pours make redundant are removed, each with the wires that end at it, when KiCad's refill and DRC, the fill and the judge's own measures find nothing worse; `search.pour_prune` says how many went, why the others stayed and what the winner was before. On a board with pours, each judged run's `measures.pours.damage` says what the routing did to them against the unrouted board's refill (`search.baseline.pour_fills`): the pour layers that lost all their fill, the share of the pour nets' planes no longer kept in one piece, and the share of pour copper that is gone; it changes no gate, and it ranks through the pour key unless the user config's `routing.rank_key` is `routing`. Every judged run carries two keys, `key` (today's) and `pour_key` (today's with four pour entries); `routing.rank_key` (`pours`, the default, or `routing`) says which ranks, is read on every fastroute call, and a config that cannot be read refuses the call; `search.rank` names the key that ranked, where it came from, and the run the other key puts first (`other_winner`).`engine: \"freerouting\"` routes with the local Freerouting JAR instead (it does not tune lengths: a design intent with a length group or pair skew gets `length_matching_note`); the rest of this description is that engine. It uses the documented session/job state machine and never sends board data to a cloud service. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
+            "Route an existing Specctra DSN and create a new SES file; an existing output is never replaced. Before anything starts, the board the DSN was exported from must be open in KiCad's PCB editor (the session is applied to the live board), else the call refuses at once; `require_live_board: false` routes the saved board without KiCad. The default engine is fastroute's best-of-N search: it routes variants of the DSN in parallel for the time `effort` allows (`fast` = 2 runs, `m` = 240 s, `h` = 720 s, `xh` = 2400 s), Konnect judges every run itself on scratch copies of the board (complete, KiCad DRC no worse than the unrouted board, track widths) and writes the best session; every level runs for its whole time (no run cap); `search` counts every outcome and lists the best runs (`search.json` in the search folder lists every run), `completion.judged` the winner's verdict, and `status` is never `complete` of either kind unless the winner passes all four gates (`incomplete` when connections stay open after the refill and stitching, else `complete_with_gate_failures`; the fourth gate checks the design intent's length groups and pair skews, and the board's own KiCad length and skew rules, as KiCad measures them: with a group or skew declared, `length_matching` says what was tuned, measured and not checked, and the next steps give KiCad rules that keep checking it). When every gate passes and the judge added no stitching via, `status` is the judge's, not the router's count (which takes a connection a pour makes for one it left); `completion.router_unrouted` keeps the count. When the winner passes every gate and the judge added no stitching, the ground vias its filled pours make redundant are removed, each with the wires that end at it, when KiCad's refill and DRC, the fill and the judge's own measures find nothing worse; `search.pour_prune` says how many went, why the others stayed and what the winner was before. On a board with pours, each judged run's `measures.pours.damage` says what the routing did to them against the unrouted board's refill (`search.baseline.pour_fills`): the pour layers that lost all their fill, the share of the pour nets' planes no longer kept in one piece, and the share of pour copper that is gone; it changes no gate, and it ranks through the pour key unless the user config's `routing.rank_key` is `routing`. Every judged run carries two keys, `key` (today's) and `pour_key` (today's with four pour entries); `routing.rank_key` (`pours`, the default, or `routing`) says which ranks, is read on every fastroute call, and a config that cannot be read refuses the call; `search.rank` names the key that ranked, where it came from, and the run the other key puts first (`other_winner`).`engine: \"freerouting\"` routes with the local Freerouting JAR instead (it does not tune lengths: a design intent with a length group or pair skew gets `length_matching_note`); the rest of this description is that engine. It uses the documented session/job state machine and never sends board data to a cloud service. The job settings are read back from Freerouting before it starts, and the run is refused if any was not applied; the result reports them in `effective_settings` and the optimizer's outcome in `optimizer`. `status` is `complete` only when Freerouting left nothing and was given no pour as a plane (`unverified` with a plane or an unreadable count, `incomplete` when it left connections); `completion` gives the router's own count, the planes, what decides (KiCad DRC after a refill) and the exact next calls. `intent_widths` and `width_exceptions` say, from the session itself, which nets with a recorded current ended with track below their intent width, and where; `status` is then `complete_with_width_exceptions`, never plainly `complete`. A wire of such a net that cannot be measured is listed in `width_unmeasured`, and `status` is then never `complete` of either kind (`unverified`, or `incomplete` with open connections, or `stopped`). `width_policy: \"hold\"` first routes with the retry off, so with `allow_neckdown` off (the default) that pass narrows nothing; only if it leaves connections open does a Fallback pass retry at the floor width, and that pass may narrow any track, also track the first pass laid at width: `width_exceptions` is the authority on what ended narrow (`passes` lists each pass; `stopped` when the time ran out and an earlier pass's session is returned).",
             json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +207,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "With width_policy \"hold\": what to do with connections the Full pass leaves open. \"floor\": try them in a Fallback pass at the floor width; what ends narrow is listed in width_exceptions. \"none\": leave them open (status incomplete). Without \"hold\" it is not used, and the result says so."
                     },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
-                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900, "description": "The whole call, every pass of it." }
+                    "overall_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 86400, "default": 900, "description": "The whole call, every pass of it." },
+                    "require_live_board": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Both engines. true (default): before anything starts, the board named in the DSN's manifest must be open in KiCad's PCB editor, because the session is applied to the live board (apply_specctra_ses); otherwise the call refuses at once with 'the board is not open in KiCad's PCB editor: open <board> and call again'. false: route the saved board without KiCad (a bench, a smoke check); the session can be applied only once the board is open."
+                    }
                 },
                 "required": ["dsn_path", "ses_output_path"]
             }),
@@ -3829,12 +3834,20 @@ pub(crate) async fn handle_route_specctra_dsn(
     args: &serde_json::Value,
     ctx: std::sync::Arc<ToolContext>,
 ) -> anyhow::Result<CallToolResult> {
-    match super::route_fastroute::route_engine(args) {
-        Err(refusal) => Ok(refusal),
-        Ok(super::route_fastroute::Engine::Freerouting) => route_with_freerouting(args, &ctx).await,
+    let engine = match super::route_fastroute::route_engine(args) {
+        Err(refusal) => return Ok(refusal),
+        Ok(engine) => engine,
+    };
+    // Row BS: the board the DSN came from must be open in KiCad before a search
+    // that can run for many minutes, unless `require_live_board` is false.
+    if let Some(refusal) = super::board_safety::route_preflight(args, &ctx).await? {
+        return Ok(refusal);
+    }
+    match engine {
+        super::route_fastroute::Engine::Freerouting => route_with_freerouting(args, &ctx).await,
         // Row ZR, ZR0b (P12): this tool delivers a session, so its winner is pruned.
         // Row ZR, ZR5 part 2 (PK9): its key is the user config's `routing.rank_key`.
-        Ok(super::route_fastroute::Engine::Fastroute) => {
+        super::route_fastroute::Engine::Fastroute => {
             super::route_fastroute::route_with_fastroute(
                 args,
                 ctx,
@@ -7052,7 +7065,9 @@ done
             .unwrap();
         }
         let args = json!({ "dsn_path": dsn, "ses_output_path": dir.join(format!("{name}.ses")),
-                           "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+                           "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60,
+                           // Row BS: these tests route the saved board, with no KiCad.
+                           "require_live_board": false });
         let result = handle_route_specctra_dsn(&args, std::sync::Arc::new(ctx()))
             .await
             .unwrap();
@@ -7939,7 +7954,9 @@ done
             )
             .unwrap();
             let mut args = json!({ "dsn_path": dsn, "ses_output_path": dir.path().join(format!("{name}.ses")),
-                                   "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60 });
+                                   "engine": "freerouting", "jar_path": jar, "java_path": java, "overall_timeout_seconds": 60,
+                                   // Row BS: this test routes the saved board, with no KiCad.
+                                   "require_live_board": false });
             for (key, value) in extra.as_object().unwrap() {
                 args[key] = value.clone();
             }

@@ -666,6 +666,8 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "below_area",
         // plan_pours's check fields (Row ZR, stage ZR4, PP16).
         "thermal_steps",
+        // The bulk edits' result field (Row BS, board safety).
+        "live_project",
         // plan_convergent_placement's response fields and statuses (Row CT).
         "apply_with",
         "gate_failures",
@@ -1052,6 +1054,10 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         "differential_pairs_unresolved",
         // Result field of `route_specctra_dsn`'s `summary.lengths`.
         "likely_pairs",
+        // Row RW: result fields of the rule and netclass writers.
+        "plan_revision",
+        "written_to",
+        "kicad_unsaved",
         // Design-intent fields and result fields of `route_specctra_dsn` (Row LT:
         // length matching), and the rules file's extension.
         "length_groups",

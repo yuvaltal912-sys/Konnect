@@ -1,0 +1,161 @@
+#!/bin/bash
+# Send one commit and a plan of test steps to the BGU HPC cluster as one Slurm job.
+# Runs no cargo on the Mac: git bundle, tar and ssh only. See docs/HPC_OFFLOAD.md.
+#
+#   scripts/hpc/hpc-submit [options] PLAN_FILE
+#   scripts/hpc/hpc-submit [options] --cmd 'cargo test -p konnect-sexp --locked --lib'
+#
+# Options:
+#   --commit REV     commit to run (default HEAD); uncommitted changes are NOT sent
+#   --cpus N         CPUs on one node (default 8, at most 80)
+#   --mem SIZE       memory, Slurm syntax (default 8G)
+#   --time H:MM:SS   wall time (default 0:15:00, at most 4:00:00)
+#   --label TEXT     free text kept in the record (e.g. the PR or row)
+#   --dry-run        build the run folder locally and stop: nothing leaves the Mac
+#
+# Plan file: one step per line, "EXPECT NAME COMMAND...", '#' starts a comment.
+#   EXPECT is pass (exit 0 and, if libtest ran, at least one test passed), any (record
+#   only), or fail:PATCH[@TEST] (a negative control: PATCH, relative to the plan file, is
+#   applied first; at least one test must fail, and TEST, if given, must be among them).
+#   A control's exact command must appear earlier as a pass step: its baseline.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+. "$HERE/common.sh"
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+REV=HEAD CPUS=8 MEM=8G TIME=0:15:00 LABEL='' CMD='' PLAN='' DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --commit) REV=${2:?}; shift 2 ;;
+        --cpus) CPUS=${2:?}; shift 2 ;;
+        --mem) MEM=${2:?}; shift 2 ;;
+        --time) TIME=${2:?}; shift 2 ;;
+        --label) LABEL=${2:?}; shift 2 ;;
+        --cmd) CMD=${2:?}; shift 2 ;;
+        --dry-run) DRY=1; shift ;;
+        -h | --help) usage 0 ;;
+        -*) echo "unknown option: $1" >&2; usage 2 ;;
+        *) [ -z "$PLAN" ] || hpc_die "one plan file only"; PLAN=$1; shift ;;
+    esac
+done
+[ -n "$PLAN" ] || [ -n "$CMD" ] || usage 2
+[ -z "$PLAN" ] || [ -z "$CMD" ] || hpc_die "give a plan file or --cmd, not both"
+
+# --- limits -------------------------------------------------------------------
+case "$CPUS" in '' | *[!0-9]*) hpc_die "--cpus must be a number" ;; esac
+[ "$CPUS" -ge 1 ] && [ "$CPUS" -le "$HPC_MAX_CPUS" ] || hpc_die "--cpus must be 1..$HPC_MAX_CPUS"
+echo "$MEM" | grep -Eq '^[1-9][0-9]*[KMGT]?$' || hpc_die "--mem like 8G or 16000M (0 would mean the whole node)"
+echo "$TIME" | grep -Eq '^[0-9]{1,2}:[0-5][0-9]:[0-5][0-9]$' || hpc_die "--time must be H:MM:SS"
+IFS=: read -r th tm ts <<<"$TIME"
+minutes=$((10#$th * 60 + 10#$tm + (10#$ts > 0 ? 1 : 0)))
+[ "$minutes" -ge 1 ] && [ "$minutes" -le "$HPC_MAX_MINUTES" ] || hpc_die "--time must be at most 4:00:00"
+case "$LABEL" in *[!A-Za-z0-9\ ._:#/-]*) hpc_die "--label: letters, digits, space and ._:#/- only" ;; esac
+
+# --- commit -------------------------------------------------------------------
+SHA=$(git rev-parse --verify --quiet "$REV^{commit}") || hpc_die "no such commit: $REV"
+if [ "$REV" = HEAD ] && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "hpc: note: the working tree has uncommitted changes; only commit ${SHA:0:12} is sent." >&2
+fi
+RUNS=$(hpc_local_runs)
+mkdir -p "$RUNS"
+# Sortable by time; the random part keeps two submits in the same second apart.
+RUNID="$(date +%Y%m%d-%H%M%S)-${SHA:0:8}-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+STAGE="$RUNS/$RUNID"
+mkdir "$STAGE" || hpc_die "run folder already exists: $STAGE"
+mkdir -p "$STAGE/upload/bin" "$STAGE/upload/patches"
+
+# --- plan ---------------------------------------------------------------------
+PLAN_OUT="$STAGE/upload/plan.txt"
+if [ -n "$CMD" ]; then
+    printf 'pass cmd %s\n' "$CMD" >"$PLAN_OUT"
+else
+    [ -f "$PLAN" ] || hpc_die "no plan file: $PLAN"
+    PLAN_DIR=$(cd "$(dirname "$PLAN")" && pwd)
+    : >"$PLAN_OUT"
+    : >"$STAGE/.pass-commands"
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in '' | \#*) continue ;; esac
+        read -r expect name rest <<<"$line"
+        [ -n "${rest:-}" ] || hpc_die "plan line has no command: $line"
+        case "$name" in *[!A-Za-z0-9._-]*) hpc_die "step name '$name': letters, digits and ._- only" ;; esac
+        case "$expect" in
+            pass | any) ;;
+            fail:*)
+                spec=${expect#fail:} want_test=''
+                case "$spec" in *@*) want_test=${spec#*@}; spec=${spec%%@*} ;; esac
+                case "$want_test" in *[!A-Za-z0-9_:]*) hpc_die "control test name '$want_test': letters, digits, _ and : only" ;; esac
+                [ -f "$PLAN_DIR/$spec" ] || hpc_die "control patch not found: $PLAN_DIR/$spec"
+                grep -Fxq -- "$rest" "$STAGE/.pass-commands" ||
+                    hpc_die "control '$name' has no baseline: put a pass step with the same command before it"
+                n=$((n + 1))
+                cp "$PLAN_DIR/$spec" "$STAGE/upload/patches/$n.patch"
+                expect="fail:patches/$n.patch${want_test:+@$want_test}"
+                ;;
+            *) hpc_die "EXPECT must be pass, any or fail:PATCH, not '$expect'" ;;
+        esac
+        [ "$expect" = pass ] && printf '%s\n' "$rest" >>"$STAGE/.pass-commands"
+        printf '%s %s %s\n' "$expect" "$name" "$rest" >>"$PLAN_OUT"
+    done <"$PLAN"
+    [ -s "$PLAN_OUT" ] || hpc_die "the plan has no steps"
+fi
+
+# --- bundle: exactly this commit, as ref refs/heads/run ------------------------
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+git init -q "$tmp/b"
+echo "$(cd "$(git rev-parse --git-common-dir)" && pwd)/objects" >"$tmp/b/.git/objects/info/alternates"
+git -C "$tmp/b" update-ref refs/heads/run "$SHA"
+git -C "$tmp/b" bundle create -q "$STAGE/upload/commit.bundle" run
+git -C "$tmp/b" bundle verify -q "$STAGE/upload/commit.bundle" >/dev/null 2>&1 ||
+    hpc_die "the bundle of $SHA did not verify"
+
+cp "$HERE/remote/prepare.sh" "$HERE/remote/job.sbatch" "$HERE/remote/run-plan.sh" "$STAGE/upload/bin/"
+{
+    printf 'RUNID=%q\nSHA=%q\nCPUS=%q\nMEM=%q\nTIME=%q\nLABEL=%q\n' "$RUNID" "$SHA" "$CPUS" "$MEM" "$TIME" "$LABEL"
+    printf 'PARTITION=%q\nACCOUNT=%q\nQOS=%q\nSIF=%q\n' "$HPC_PARTITION" "$HPC_ACCOUNT" "$HPC_QOS" "$HPC_SIF"
+    printf 'PROTOC_VERSION=%q\nPROTOC_SHA256=%q\n' "$HPC_PROTOC_VERSION" "$HPC_PROTOC_SHA256"
+    printf 'SUBMITTED=%q\n' "$(date '+%F %T %z')"
+} >"$STAGE/upload/meta.env"
+cp "$STAGE/upload/meta.env" "$STAGE/meta.env"
+
+echo "run $RUNID: commit $SHA, $CPUS CPUs, $MEM, $TIME"
+sed 's/^/  step: /' "$PLAN_OUT"
+if [ "$DRY" = 1 ]; then
+    echo "dry run: run folder is $STAGE (nothing sent)."
+    exit 0
+fi
+
+# --- send ---------------------------------------------------------------------
+hpc_check_connection
+jobs=$(hpc_user_jobs)
+if [ -n "$jobs" ]; then
+    rm -rf "$STAGE"
+    echo "hpc: the 1-job quota is in use; not submitting. Your jobs:" >&2
+    echo "$jobs" | sed 's/^/  /' >&2
+    exit 3
+fi
+REMOTE_RUN="$HPC_REMOTE_ROOT/runs/$RUNID"
+tar -C "$STAGE/upload" -cf - . | hpc_remote "mkdir -p $(printf %q "$HPC_REMOTE_ROOT/runs") && mkdir $(printf %q "$REMOTE_RUN") && tar -C $(printf %q "$REMOTE_RUN") -xf -" ||
+    hpc_die "upload to $HPC_HOST:$REMOTE_RUN failed"
+set +e
+hpc_remote "bash $(printf %q "$REMOTE_RUN/bin/prepare.sh") $(printf %q "$REMOTE_RUN")" 2>&1 | tee "$STAGE/prepare.out"
+status=${PIPESTATUS[0]}
+set -e
+JOBID=$(sed -n 's/^JOBID=\([0-9][0-9]*\)$/\1/p' "$STAGE/prepare.out" | tail -n 1)
+if [ -z "$JOBID" ]; then
+    # The connection may have dropped after sbatch: look for the job before giving up.
+    JOBID=$(hpc_remote "squeue -h -u \"\$USER\" -n konnect-$RUNID -o %i; cat $(printf %q "$REMOTE_RUN/jobid") 2>/dev/null" 2>/dev/null |
+        grep -E '^[0-9]+$' | head -n 1 || true)
+    [ -n "$JOBID" ] && echo "hpc: prepare's output was cut off, but job $JOBID exists for this run; recorded it." >&2
+fi
+if [ -z "$JOBID" ]; then
+    hpc_die "prepare failed (exit $status); see $STAGE/prepare.out"
+fi
+echo "$JOBID" >"$STAGE/jobid"
+rm -f "$STAGE/upload/commit.bundle" # 12 MB; meta.env holds the SHA
+echo "submitted: job $JOBID, run $RUNID"
+echo "  status: scripts/hpc/hpc-status $RUNID"
+echo "  fetch:  scripts/hpc/hpc-fetch $RUNID   (after it ends)"

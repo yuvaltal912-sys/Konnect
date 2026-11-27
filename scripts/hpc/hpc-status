@@ -1,0 +1,32 @@
+#!/bin/bash
+# Show the cluster quota and one run's state. Read-only on both sides.
+#
+#   scripts/hpc/hpc-status            newest local run
+#   scripts/hpc/hpc-status RUN_ID     that run
+#   scripts/hpc/hpc-status --quota    only your jobs on the cluster (the 1-job quota)
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+. "$HERE/common.sh"
+
+hpc_check_connection
+jobs=$(hpc_user_jobs)
+if [ -n "$jobs" ]; then
+    echo "quota: IN USE (1 job per user, running or queued)"
+    echo "$jobs" | sed 's/^/  /'
+else
+    echo "quota: free"
+fi
+[ "${1:-}" = --quota ] && exit 0
+
+RUNID=${1:-$(hpc_latest_run)}
+hpc_valid_run_id "$RUNID"
+STAGE="$(hpc_local_runs)/$RUNID"
+[ -f "$STAGE/jobid" ] || hpc_die "run $RUNID has no job id (dry run, or submit failed: $STAGE)"
+JOBID=$(cat "$STAGE/jobid")
+REMOTE_RUN="$HPC_REMOTE_ROOT/runs/$RUNID"
+echo "run $RUNID, job $JOBID"
+hpc_remote "sacct -j $JOBID -X -n -P --format=JobID,State,ExitCode,Elapsed,AllocCPUS,ReqMem,AllocTRES,NodeList" |
+    awk -F'|' '{ printf "  sacct: %s %s exit %s elapsed %s cpus %s mem %s tres %s node %s\n", $1, $2, $3, $4, $5, $6, $7, $8 }'
+echo "  progress:"
+hpc_remote "tail -n 8 $(printf %q "$REMOTE_RUN")/slurm-$JOBID.out 2>/dev/null || echo '(not started yet)'" | sed 's/^/    /'

@@ -3,6 +3,180 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `delete_all_routing`, one call for all routing (Row DR)
+
+**A new tool, nothing removed or renamed.** `delete_all_routing` (toolset `pcb_routing`,
+live KiCad only) removes every track, arc and via from the open board in one KiCad undo
+step. Before it, a board that `export_specctra_dsn` refused for unlocked routing needed one
+`delete_trace` or `delete_via` call per item.
+
+- `delete_all_routing(board)`: the preview (`dry_run`, default `true`) changes nothing.
+  It returns `will_delete` (`total`, `tracks`, `arcs`, `vias`, `by_net` (at most 100 nets,
+  largest first, with `nets_total`), `by_layer`, where a via's layer is its span, such as
+  `F.Cu-B.Cu`), `kept_locked`, `never_touched` and `plan_revision`; `status` is `ready`
+  or `noop`.
+- `delete_all_routing(board, dry_run=false, expected_plan_revision=...)`: the apply.
+  `expected_plan_revision` is required, and any change to the board since the preview,
+  or a different `include_locked`, makes it `stale_target`; nothing is deleted. The
+  apply reads the board back and returns `removed` (as `will_delete`), `routing_left`
+  and `never_touched` (the linked objects KiCad may update with their tracks, before and
+  after: teardrop zones, groups, generated tuning patterns). A planned item still on the
+  board, a locked item gone, a new routing item or any other object changed is
+  `mutation_outcome_uncertain` and names what differs. The board is not saved.
+- `include_locked` (default `false`): locked tracks, arcs and vias, and routing held by a
+  locked group (nested groups too), are kept unless it is `true`. `kept_locked` counts
+  them (`held_only_by_locked_groups`) and lists in `export_will_refuse` the kept items
+  `export_specctra_dsn` would still refuse (a group-only lock, locked arcs, blind or
+  micro vias, vias that are not through vias, drills it cannot take, no net, zero-length
+  tracks, a lock written the old way).
+- Only top-level `segment`, `arc` and `via` items are sent to KiCad for deletion. Zones,
+  footprints, graphics and text never are; KiCad itself may remove the teardrop zones,
+  tuning patterns and routing-only groups that belong to deleted tracks, which
+  `never_touched.kicad_updated` says (for example "KiCad removed 4 teardrop_zones with
+  their tracks").
+
+## Unreleased: board safety (Row BS)
+
+**A behaviour change** for `route_specctra_dsn`, plus additive fields.
+
+- **`route_specctra_dsn` (both engines) checks the board before it starts.** The
+  board named in the DSN's manifest (`board_path`) must be open in KiCad's PCB
+  editor, or the call refuses at once (`editor_unavailable`), before any search
+  folder is made: "The board is not open in KiCad's PCB editor: open <board> and
+  call again. Nothing was routed: …". A DSN with no readable manifest is not
+  checked; the route refuses it with its own reason, as before. **Migration:** a
+  caller that routes a saved board with no KiCad running (a bench, a smoke check)
+  passes the new argument `require_live_board: false` (default `true`).
+- **"Board not open" reads plainly everywhere.** When KiCad answers
+  `GetOpenDocuments` with `AS_UNHANDLED` (no PCB editor at the endpoint), the
+  shared classifier's message now starts with "the board is not open in KiCad's
+  PCB editor: open <board> and call again", followed by KiCad's own answer; every
+  tool built on it carries that message inside its own refusal. `AS_UNIMPLEMENTED`
+  says Konnect cannot confirm the board is open. KiCad unreachable, where a live
+  board is required (`board_source: "live"`, the route pre-flight), reads "KiCad
+  cannot be reached, so Konnect cannot see <board> open in its PCB editor: start
+  KiCad, open the board there and call again". Neither claims the board is
+  closed. Error kinds and which calls refuse are unchanged; only message text
+  changed.
+- **`set_component_placements` and `apply_specctra_ses` checkpoint first.** Before
+  the tool runs, the project's saved files are checkpointed (`create_checkpoint`'s
+  store, `reason` `automatic`, label `automatic: before <tool>`); a checkpoint whose
+  files are exactly the saved files now, and whose stored copies still read back,
+  is reused instead. **Refusals (`plan_blocked`, nothing changed):** no
+  `<board>.kicad_pro` beside the board, or a checkpoint that cannot be made (for
+  example a project over the checkpoint limits, 256 MB or 4096 files). A `board`
+  that names no file is left to the tool's own refusal. `apply_specctra_ses` takes
+  no checkpoint when KiCad answered that it does not hold the board, or could not
+  be seen to hold it (unreachable, unable to list its boards): it refuses on its
+  own then. New result field `live_project`: `summary`, `board`, `project`,
+  `board_open_in_kicad` (`true`, `false` when KiCad answered without the board, or
+  `null` when Konnect could not see or KiCad did not answer cleanly),
+  `unsaved_changes_before_call` (the live board differed from its saved file;
+  `null` when unknown), `checkpoint` (`checkpoint_id`, `created_utc`,
+  `made_by_this_call`, `location`, `locks_present`) and `restore` (`tool`,
+  `arguments`, `close_the_board_in_kicad_first` and `only_after_the_edit_is_saved`,
+  both `null` when unknown). On a live board the way back is Edit > Undo; the
+  checkpoint holds the saved files, so it matters once the edit is saved. On an
+  error result the summary offers no way back (no change is known) unless the
+  error's kind says the board may have changed (`mutation_outcome_uncertain`,
+  `ipc_outcome_unknown`): then it says to inspect the board first. On a
+  plain-text result the field comes as a second text block.
+
+## Unreleased: project-rule writes while the board is open (Row RW)
+
+Additive except where named. Nothing is removed or renamed.
+
+- **`create_netclass` works while KiCad holds the board** (it refused before). It
+  sends the change to KiCad's own copy of the project over IPC (`SetNetClasses`,
+  merge), reads it back (`GetNetClasses`), then writes the same change to the
+  `.kicad_pro`, so KiCad's next save keeps it. New result fields: `written_to`
+  (`["project_file"]`, or `["kicad", "project_file"]`), `kicad` (`kicad_copy`
+  `created`/`updated`, `read_back`, `board_nets_resync: at_next_drc_or_save`,
+  `kicad_unsaved`, `board_setup_open`), `repaired_default_fields` when a Default was
+  completed, and `warning` when KiCad's copy and the file differ. It needs KiCad
+  10.0.7 or later: 10.0.1 to 10.0.6 leave a class written over IPC in a state their
+  next save reads past the end of (`netclass.cpp:223`, fixed in 10.0.7), so an older
+  KiCad is refused with the Board Setup steps. It also refuses, with nothing sent
+  and nothing written, when KiCad does not list its classes, when only one of the
+  two copies has the class (an unsaved change in KiCad), or when the schematic is
+  open in a KiCad other than the one holding the board. When KiCad took the change
+  but did not confirm it, or the file write failed after it, the refusal says what
+  KiCad's copy may hold, and the file is not written.
+  **Changed:** `clearance`, `trace_width`, `via_drill` and `via_diameter` must be
+  finite and at most 100 mm, above 0 (a clearance may be 0), and `name` must not be
+  empty or hold control characters; before, any value was written. A call that names
+  no value on a class both copies have sends nothing (`kicad_copy: unchanged`).
+- **`get_netclasses`: new `kicad_unsaved`** (and `sources.kicad_unsaved`): the
+  netclass settings the KiCad holding the board has in memory and its file does not
+  (`netclass`, `field`, `kicad_mm`, `project_file_mm`; `field: priority` with
+  `kicad` and `project_file`; or `only_in`). `null` when no KiCad holding the board
+  listed its classes. When it is not empty, a `warning` says that KiCad's next save
+  writes its copy over the file, and how to keep either copy.
+- **`assign_net_to_class` still refuses while KiCad holds the board** (KiCad 10's
+  IPC API has no netclass-pattern command); the refusal now names the steps in
+  KiCad's Board Setup.
+- **`create_custom_drc_rule` takes several rules at once.** New `rules` (1 to 64
+  items, each `{name, rule}` or `{name, constraint, minimum_mm}`) instead of
+  `name`/`rule`/`constraint`/`minimum_mm`, and `replace_existing` (with `rules`
+  only; replaces a rule of the same name in place). One preview, one
+  `plan_revision`, one apply; nothing is written unless every rule is valid. `name`
+  is no longer required at the top level (the schema's `oneOf` asks for it in the
+  single forms). New result fields: `rules` (`name`, `action`: `created`,
+  `replaced`, `edited`, `deleted`, `unchanged`) and `board_source`; the single forms
+  keep `rule`.
+- **The three custom-rule tools work while KiCad holds the board or the schematic**
+  (they refused before). KiCad never writes `.kicad_dru` when it saves and reads it
+  again at every DRC. The target DRC runs on the board KiCad holds when it answers
+  over IPC (`target_board_drc.source: scratch_copy_of_live_board`), else on the
+  saved file. With a live board the plan revision binds the rules file and the
+  project, not the board's text. New `kicad` note on a live board, `warning` when a
+  board lock exists but KiCad did not answer.
+- **`route_specctra_dsn` (fastroute): one rules step.** With length groups or pairs
+  with `max_skew_mm`, `completion.next_steps` gives one `create_custom_drc_rule`
+  call with every rule in `rules=[...]` (JSON; split into calls of at most 64 rules),
+  followed by a line for each rule that needs a note; before, one line per rule.
+
+## Unreleased: `plan_convergent_placement` runs in the background
+
+**A behaviour change.** A call with `board` no longer waits for the plan. It answers
+at once with `status: started`, a `run_id`, `board`, `effort`, `planned_from`,
+`records` (the run folder) and `next_steps`. Before, a run at effort h could outlast
+the MCP client's time limit (the client gives up after about 1,800 s), and its
+result was lost.
+
+- **New arguments:** `run_id` (report a run) and `wait_s` (with `run_id` only: wait
+  up to 0 to 600 s for the run to end; default 0). `board` is no longer required: a
+  call gives either `board` (with `effort` and `fastroute_path`) or `run_id` (with
+  `wait_s`), and any mix is refused.
+- **A running run** answers `status: running` with `run_id`, `board`, `elapsed_s`,
+  `phase` (`starting`, `generating`, `converging`, `routing`, `writing`),
+  `candidates` (`generated` of `generate_total`, `converge_runs`, `to_route`,
+  `judged`, `routed`), `effort_level_reached` (family C's effort level),
+  `routing_effort`, `records` and `next_steps`. A run of another Konnect process adds
+  `served_by_pid` and `progress_as_of`; its progress is the last one it wrote (every
+  10 s). `converge_runs` also counts the starts a stop rule discarded, so it can end
+  above the result's `search.converge_runs`.
+- **A finished run** answers the whole result as before (`status` `planned`,
+  `planned_with_gate_failures`, `no_candidate` or `not_routed`, `apply_with`,
+  `winner.moves`, `winner.change`, ...) plus `run_id`. It is kept in the run folder
+  (`result.json`, beside `run.json`, the run's record), so the same call reads it
+  after a server restart, as long as the folder exists.
+- **Errors:** a failed run is an error result with `status: failed`, `error`,
+  `run_id`, `board`, `records` and `next_steps`; a run whose server stopped before it
+  ended is the same with `status: interrupted`. A second start on a board with a run
+  is refused, before KiCad is read, and names the running `run_id`. An unknown or
+  malformed `run_id` is an argument error. A report call needs neither KiCad nor the
+  board open.
+- **No synchronous mode** and no cancel call: no caller needs either. A board's run
+  ends by its own stop rules. A server that ends (its stdio closed or failed, or a
+  reload) stops its runs first and starts no new one, so their router processes are
+  killed rather than left running; such a run reads `status: failed` with `error`
+  saying the server stopped. A signal that kills the server (SIGTERM, SIGKILL) skips
+  that, as before this change: Konnect installs no signal handler, and an HTTP-only
+  server ends only so. Its run then reads `status: interrupted`.
+- **Migration:** after a start, call again with `{"run_id": ..., "wait_s": 300}`
+  until `status` is not `running`, then read the result as before.
+
 ## Unreleased: the route and placement results say what they did not check
 
 Additive only: no argument changes, nothing removed or renamed, `status` unchanged.

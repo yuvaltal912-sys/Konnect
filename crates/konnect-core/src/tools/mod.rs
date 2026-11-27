@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod board_extents_tests;
 pub mod board_geometry;
+pub(crate) mod board_safety;
+#[cfg(test)]
+mod board_safety_tests;
 mod board_session;
 mod board_source;
 #[cfg(test)]
@@ -47,6 +50,7 @@ mod library_footprint;
 pub(crate) mod live_board;
 pub mod manufacturing;
 pub(crate) mod navigation_target;
+pub(crate) mod netclass_live;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
@@ -779,10 +783,17 @@ where
             // is gone — and the two unsupported statuses part company here,
             // because only one of them is evidence about KiCad's editors.
             Err(error) => match BoardEditorAbsence::from_error(&error) {
+                // Row BS (board safety): the plain sentence first, KiCad's own
+                // answer after it, so every consumer of `message` says what to
+                // do before it says what KiCad sent.
                 Some(absence) => {
                     return Ok(BoardBinding::Unserved {
                         absence,
-                        message: format!("{error:#}"),
+                        message: board_safety::unserved_message(
+                            &observation,
+                            absence,
+                            &format!("{error:#}"),
+                        ),
                     })
                 }
                 None => return Err(error),

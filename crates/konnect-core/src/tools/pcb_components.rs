@@ -1966,7 +1966,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
             "set_component_placements",
-            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks.",
+            "Set X/Y positions and rotations for multiple existing footprints atomically. Uses one live KiCAD IPC update and one undo step when reachable; otherwise safely edits a closed board file once with revision checks. Checkpoints the project's saved files first (reusing a checkpoint of exactly those files); the result's live_project names it and what it does not hold.",
             json!({
                 "type": "object",
                 "properties": {

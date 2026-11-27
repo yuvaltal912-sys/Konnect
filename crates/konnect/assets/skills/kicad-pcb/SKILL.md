@@ -269,10 +269,29 @@ an unproved outline is not completion evidence.
   sit on the edge. `run_design_review`, `audit_manufacturing` and
   `validate_for_manufacturing` run the same containment check on courtyards,
   pads and silkscreen text.
+- `set_component_placements` and `apply_specctra_ses` checkpoint the project's
+  saved files themselves before they run (reusing one that holds exactly those
+  files). Tell the user **live_project.summary**: it says the real project was
+  edited, which checkpoint restores it, and whether unsaved changes in KiCad are
+  outside it. A refusal that says the board is not open in KiCad's PCB editor
+  means: ask the user to open that board, then call again. Pass
+  `require_live_board: false` to `route_specctra_dsn` only when the user wants to
+  route the saved board without KiCad.
 - `plan_convergent_placement` (placement toolset) plans a whole board for a board
   open in KiCad: the parts locked in KiCad stay, the convergent search places the
   rest, and it routes its three best candidates to pick the winner (minutes). It
-  writes nothing. Show the user **winner**, **candidates** and **notes**; only on
+  writes nothing. It runs in the background: the call with `board` answers at once
+  with **status** `started` and a **run_id**. Then call it with only
+  `{"run_id": ..., "wait_s": 300}` (keep `wait_s` under your client's tool time
+  limit) and tell the user the **phase** and **candidates** counts each time, until
+  **status** is no longer `running`; that answer is the whole plan. A second start
+  on the same board is refused and names the running id: report that run instead.
+  A report call needs neither KiCad nor the board open. The result stays in the run
+  folder, so the same call reads it later, after a server restart too. **status**
+  `failed` (with its **error**; a server that stopped ends its runs so) or
+  `interrupted` (the server was killed before the run ended) carries no plan: tell
+  the user and start a new run. Show the user
+  **winner**, **candidates** and **notes**; only on
   their explicit OK call `create_checkpoint`, then `set_component_placements` with
   **apply_with.arguments** exactly as returned: the plan is legal as a whole, so it
   is the one plan applied in one batch instead of the small batches above. Then
@@ -406,8 +425,11 @@ each net its length, its window and its miss, `pass` per group, and
 `complete_with_gate_failures`. The next steps give a KiCad rule for each group.
 A session that breaks the board's own length or skew rules cannot be applied:
 `apply_specctra_ses` rolls back when the board has a `.kicad_dru` and the
-candidate's DRC is not clean. After `apply_specctra_ses`, add them with `create_custom_drc_rule(board, name,
-rule)` (dry run first) so KiCad keeps checking the lengths after hand edits.
+candidate's DRC is not clean. After `apply_specctra_ses`, add them all with the
+one `create_custom_drc_rule(board, rules=[...])` call the next step gives (dry run
+first, then apply with its `plan_revision`; add `replace_existing=true` when an
+earlier route already wrote rules of these names) so KiCad keeps checking the
+lengths after hand edits. The board may stay open in KiCad.
 A pair inside a group is tuned net by net (`pairs_tuned_net_by_net`): its
 coupling is not held along the meanders. The judge compares each tuned board with
 the same run's untuned board and rejects a tuned one that is worse in unconnected
@@ -460,6 +482,12 @@ When the user asks for Freerouting (`engine: 'freerouting'`), use the local Free
    reverse manifest together. Rust export is the default
    (`native_bridge_mode: 'disable'`); no native plugin is required. Existing
    output files are refused. Do not change the board while routing this revision.
+   If the export refuses unlocked routing, remove it in one call, not item by
+   item: `delete_all_routing(board)` previews what goes (by kind, net and
+   layer) and what stays (locked routing; zones, footprints and graphics are
+   never deleted); tell the user the counts, then apply with
+   `delete_all_routing(board, dry_run=false, expected_plan_revision=...)`,
+   `save_project`, and export again. One Ctrl+Z in KiCad undoes the delete.
 3. Call `route_specctra_dsn(dsn_path, ses_output_path='new-result.ses',
    engine='freerouting', jar_path?, java_path?)`. It runs the local JAR's native headless MCP server
    and writes a new SES; creating that file does not prove every net was routed.
@@ -501,8 +529,9 @@ When the user asks for Freerouting (`engine: 'freerouting'`), use the local Free
 7. If any pour went to the router as a plane (`completion.planes` is not
    empty), follow `completion.next_steps`. The checkpoint taken before step 4
    keeps the exported board: the fallback needs it back, because
-   `export_specctra_dsn` refuses a board that holds unlocked routing. After
-   the import, stitch.
+   `export_specctra_dsn` refuses a board that holds unlocked routing. (With
+   KiCad still open, `delete_all_routing` removes that routing instead,
+   preview then apply, and keeps the locked wiring.) After the import, stitch.
    Call `plan_route_refinement(board, kinds=['stitching'], nets=[the plane
    nets], search_radius_mm=3)` with the effort chosen for this task, adopt the
    stitching vias you support with `route_batch`, then refill and run DRC
@@ -544,8 +573,8 @@ still be routed narrower than its current needs; the routing result's
 `width_exceptions` names each such stretch (step 3). Mounting
 holes and copper graphics or text become keepouts (text as a generous square).
 Locked straight tracks (on any copper layer) and through vias are preserved.
-Unlocked routing, routed arcs, custom pad shapes, local clearance overrides,
-custom DRC rules, incomplete routing rules, blind/buried vias, copper
+Unlocked routing (remove it with `delete_all_routing`), routed arcs, custom
+pad shapes, local clearance overrides, custom DRC rules, incomplete routing rules, blind/buried vias, copper
 dimensions and KiCad `jumper` layers are refused. Boards with back-side parts
 use the Rust exporter: KiCad's native exporter is not adopted for them.
 
@@ -620,7 +649,17 @@ create_netclass(board, name, trace_width?, clearance?, via_drill?, via_diameter?
 ```
 
 The class is written to the project's `.kicad_pro` file, which is where KiCad
-has kept netclasses since v7 — the board file is not modified.
+has kept netclasses since v7 — the board file is not modified. The board may stay
+open in KiCad (KiCad 10.0.7 or later): the change goes to KiCad's own copy first
+over IPC and is read back, then to the file (`written_to`), so KiCad's next save
+keeps it. Ask the user to keep KiCad's Board Setup closed meanwhile: its OK writes
+the dialog's own copy of every netclass back. KiCad's
+open board applies it to its nets at its next DRC or save, so before routing
+from the live board, save in KiCad or run `run_drc` with `sync_live_board=true`.
+A width changed in KiCad's own Board Setup is not in the file until KiCad saves:
+`get_netclasses` lists such values in `kicad_unsaved`; when it is not empty, ask
+the user to save in KiCad before routing. `assign_net_to_class` still refuses
+while KiCad holds the board and gives the Board Setup steps instead.
 
 Before creating or updating a class, read `get_netclasses` and the applicable
 design-rule/trace-sizing references. Derive width, clearance, gap, drill, and
@@ -838,7 +877,8 @@ vias. It is not an autorouter and does not replace the Freerouting failure rule.
 Inspect readback IDs and the outcome before continuing. Live netclasses supply
 omitted widths and via dimensions; narrower widths and ambiguous pad routes
 refuse. Use `modify_trace` for partial in-place edits and `query_vias` /
-`delete_via` for observed via identities. A successful edit still needs the
+`delete_via` for observed via identities; `delete_all_routing` removes every
+unlocked track, arc and via at once. A successful edit still needs the
 relevant clearance/connectivity checks; an uncertain result needs live-board
 inspection before retrying.
 
@@ -956,7 +996,11 @@ current capacity/thermal relief nor replaces the Freerouting failure policy.
 
 Use `create_custom_drc_rule`, `edit_custom_drc_rule` and `delete_custom_drc_rule`
 to preview saved custom-rule changes before applying the returned revision.
-Close the board and its root schematic before writing rules. General KiCad rule
+The board and schematic may stay open in KiCad (KiCad never rewrites
+`.kicad_dru` on save and reads it again at its next DRC); do not edit Custom
+Rules in KiCad's Board Setup at the same time. Several rules go in one
+`create_custom_drc_rule(board, rules=[...])` call: one preview, one revision,
+one apply. General KiCad rule
 statements are compiled on scratch copies; a successful edit does not establish
 that the board passes DRC.
 

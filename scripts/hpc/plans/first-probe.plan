@@ -1,0 +1,12 @@
+# First cluster job: learn what the node has, then two focused test runs.
+# Submit: scripts/hpc/hpc-submit --cpus 16 --mem 16G --time 0:30:00 --label "first probe" scripts/hpc/plans/first-probe.plan
+#
+# EXPECT  NAME            COMMAND
+any       probe           echo "== tools"; cc --version | head -n 1; cmake --version | head -n 1; ${PROTOC:-protoc} --version; cargo mutants --version; echo "== disk"; df -h "$HOME" "$CARGO_TARGET_DIR" "$TMPDIR"; quota -s 2>/dev/null; echo "== network from the node"; curl -sS -m 10 -o /dev/null -w "crates.io %{http_code}\n" https://index.crates.io/config.json
+# Pure Rust, no C or protoc: proves the pipeline even if the node lacks cmake or protoc.
+pass      sexp-lib        cargo test -p konnect-sexp --locked --lib
+# konnect-core builds nng (cmake, C) and the IPC protos (protoc 36.2, which prepare.sh installs).
+# Linux skip: whole_runs_are_the_recorded_goldens compares bit-exact costs recorded on the
+# Mac (aarch64); on x86_64 one intermediate cost differs by 8 ulp (docs/HPC_OFFLOAD.md).
+# Job 20895 ran this step without the skip (67 passed, that 1 failed); the skip itself has not run yet.
+pass      core-converge   cargo test -p konnect-core --locked --lib place_converge -- --skip place_converge::tests::whole_runs_are_the_recorded_goldens
