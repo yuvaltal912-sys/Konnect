@@ -53,8 +53,9 @@ rustc -V | grep -q "^rustc $want " || { echo "toolchain is not $want" >>"$OUT/en
 # Ordinary steps keep the shared target, the warm cache. Wrappers early on PATH unset it for a
 # `cargo [+toolchain] [options] mutants ...` or `cargo-mutants ...` process, whatever the step's
 # command looks like, and say so in the step's log. The cargo wrapper reads the subcommand as
-# cargo does: the first word that is not an option, a `+toolchain` or the value of an option
-# that takes one (`--manifest-path PATH`, `--config KV`, `-Z FLAG`, `-C DIR`, `--color WHEN`).
+# cargo does: the first word that is not an option, a `+toolchain` or the value of a global
+# option that takes one (`-C DIR`, `-Z FLAG`, `--config KV`, `--color WHEN`, `--explain CODE`;
+# `--manifest-path` and `--target-dir` too, which cargo rejects before a subcommand anyway).
 SHIM="$RUN/scratch/bin"
 mkdir -p "$SHIM"
 real_cargo=$(command -v cargo || true)

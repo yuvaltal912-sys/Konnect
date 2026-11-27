@@ -118,16 +118,18 @@ Measured on the cluster, 2026-11-27 (16 CPUs, 16 GB, `hpc-node5`, x86_64):
 | `konnect-sexp` tests (`--lib`) | 168 s cold, including its build; 32 s warm. 227 passed, 2 ignored |
 | `konnect-core` cold build plus the `place_converge` tests | 245 s for the step, of which the tests took 77 s |
 | `cargo mutants` on `konnect-sexp/src/net.rs`, `--jobs 4`, before the fix (job 20898, shared target) | 42 mutants in 6 minutes: 19 caught, 22 unviable, 1 missed |
-| The same, `mutants-probe.plan` as committed, through the fix (job 20921, `hpc-node5`) | 42 mutants in 5 minutes: 40 caught, 1 unviable, 1 missed |
+| The same, through the fix: `mutants-probe.plan`'s three steps word for word, in a six-step proof plan (job 20921, `hpc-node5`) | 42 mutants in 5 minutes: 40 caught, 1 unviable, 1 missed |
 | One PR's mutants batch: `konnect-core/src/tools/netclass_live.rs`, `--jobs 6` on 32 CPUs (job 20920, `hpc-node7`) | 81 mutants in 19.6 minutes: 75 caught, 3 missed, 3 unviable. The Mac's run of the same batch: 22 minutes, the same 3 missed |
 | `target/` after those runs | 2.3 GB (`du`, read over ssh after job 20898) |
 | Disk | the home folder is on a shared 166 TB file system with 112 TB free; `quota` reports no user quota. The node's `/tmp` has 59 GB free |
 | Network from the compute node | reaches crates.io |
 
 *Unmeasured:* the whole `cargo test --workspace --lib --tests` on Linux, the queue at busy times,
-other `--jobs` values, and `first-probe.plan` exactly as committed (with its `--skip`). The
-wrapper's reading of option values (`--manifest-path PATH mutants` and the like) is checked on
-the fake cluster only; on the cluster it ran for plain `cargo mutants` (job 20921).
+other `--jobs` values, and the two example plans as files of their own (`first-probe.plan` with
+its `--skip` has not run; `mutants-probe.plan`'s steps ran inside job 20921's proof plan, each as
+expected, while that plan's own extra shard step found 0 mutants, because its file was not on
+that commit yet, and read FAILED). The wrapper's reading of option values (`-C DIR mutants` and
+the like) is checked on the fake cluster only; on the cluster it ran for plain `cargo mutants`.
 
 The gain: one mutants batch on the cluster is about as fast as on the Mac (19.6 against 22
 minutes for the same 81 mutants), so the gain is not speed. It is the second lane: the batch
@@ -241,8 +243,8 @@ every mutant read unviable: job 20899 read 81 of 81 unviable on one PR's batch a
 `env -u CARGO_TARGET_DIR` at `--jobs 6` gave the Mac's result (job 20920, in the table above).
 So `run-plan.sh` puts two wrappers first on `PATH`: one for `cargo` that unsets the variable when
 the subcommand is `mutants`, and one for `cargo-mutants`. The subcommand is the first word that
-is not an option, a `+toolchain` or the value of an option that takes one (`--manifest-path`,
-`--config`, `-Z`, `-C`, `--color`, `--target-dir`, `--explain`), so `cargo test mutants` and
+is not an option, a `+toolchain` or the value of a global option that takes one (`-C`, `-Z`,
+`--config`, `--color`, `--explain`), so `cargo test mutants` and
 `cargo run -- mutants` keep the shared target. The job stops before any step if `cargo` on `PATH`
 is already a wrapper, which would call itself. A plan author needs no `env -u`, and a step's log says
 `hpc: cargo mutants runs without the shared CARGO_TARGET_DIR`. Every other cargo command keeps
@@ -252,7 +254,7 @@ batch spends time on the baseline build: 180 s for `konnect-core` (job 20899's l
 
 The net.rs probe shows the fix on the cluster. Before it (job 20898, `--jobs 4`, 16 CPUs): 19
 caught, 22 unviable, 1 missed. Through the wrappers, the same 42 mutants (job 20921,
-`mutants-probe.plan` as committed): 40 caught, 1 unviable, 1 missed, and the step's log carries
+`mutants-probe.plan`'s steps word for word): 40 caught, 1 unviable, 1 missed, and the step's log carries
 the wrapper's line. So 21 of the 22 unviable came from the shared target. The missed mutant
 (`names_nets_in_place` in `konnect-sexp/src/net.rs` replaced with `true`) is a gap that is already
 on `main`, not something these scripts caused.

@@ -1,8 +1,9 @@
 # cargo mutants on one file, on the cluster. Needs cargo-mutants in ~/.cargo/bin
 # (docs/HPC_OFFLOAD.md). Job 20898 (16 CPUs) ran an earlier form of this plan, with the lists
 # in $TMPDIR and a trailing echo, and with the shared CARGO_TARGET_DIR: 42 mutants in 6 minutes,
-# 22 unviable. Job 20921 ran this exact form through the wrappers: 42 mutants in 5 minutes,
-# 40 caught, 1 missed, 1 unviable, each of its three steps as expected.
+# 22 unviable. Job 20921 ran these three steps word for word, inside a six-step proof plan,
+# through the wrappers: 42 mutants in 5 minutes, 40 caught, 1 missed, 1 unviable, each of the
+# three steps as expected. This file has not run as a plan of its own.
 # Submit: scripts/hpc/hpc-submit --cpus 16 --mem 16G --time 0:30:00 --label "mutants probe" scripts/hpc/plans/mutants-probe.plan
 #
 # run-plan.sh runs every `cargo mutants` without the shared CARGO_TARGET_DIR, so --jobs above 1
