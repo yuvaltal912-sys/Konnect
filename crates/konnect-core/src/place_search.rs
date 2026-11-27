@@ -39,7 +39,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -668,6 +668,8 @@ pub(crate) fn mark_duplicates(records: &mut [Record], earlier: &[(Option<usize>,
 /// are `first_id + slot`. After the pool, a record whose board equals the input board
 /// or a lower id's becomes `duplicate` (`search` adds A's board to those it compares
 /// against).
+/// Only the tests call it: `search_observed` passes its counting generator.
+#[cfg(test)]
 pub(crate) fn generate_all(
     model: &BoardModel,
     recipes: &[Recipe],
@@ -810,6 +812,8 @@ fn recipe_of(record: &Record) -> &Recipe {
 /// `generate_failed` record and costs infinity. The result is the same for any number of
 /// threads. The starts run at level 0 whatever `params.level` holds, and the outer trace
 /// records the parameters so.
+/// Only the tests call it: `search_observed` passes its counting generator.
+#[cfg(test)]
 pub(crate) fn converge_all(
     model: &BoardModel,
     starts: &[Record],
@@ -1308,15 +1312,133 @@ fn file_call(
     }
 }
 
+// ─── Progress (Row AP2) ──────────────────────────────────────────────────────
+
+/// Where a search is, for a caller that asks while it runs (the placement tool's
+/// background runs). Every count only grows; the search writes it, any thread reads it.
+#[derive(Debug, Default)]
+pub(crate) struct SearchProgress {
+    phase: AtomicU8,
+    generated: AtomicUsize,
+    generate_total: AtomicUsize,
+    converge_runs: AtomicUsize,
+    effort_level: AtomicUsize,
+    to_route: AtomicUsize,
+    judged: AtomicUsize,
+    routed: AtomicUsize,
+}
+
+/// The phases a search goes through, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchPhase {
+    /// Before phase 1: the model and the held set.
+    Starting = 0,
+    /// Phase 1: families F, S and P make the starts.
+    Generating = 1,
+    /// Phase 1b: family C refines the best starts, then the best at rising effort.
+    Converging = 2,
+    /// Phase 3: the input check and the routing calls, one at a time.
+    Routing = 3,
+    /// The ranks and the records (`search.json`, `table.md`).
+    Writing = 4,
+}
+
+impl SearchPhase {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SearchPhase::Starting => "starting",
+            SearchPhase::Generating => "generating",
+            SearchPhase::Converging => "converging",
+            SearchPhase::Routing => "routing",
+            SearchPhase::Writing => "writing",
+        }
+    }
+}
+
+/// One reading of a [`SearchProgress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgressSnapshot {
+    pub phase: SearchPhase,
+    /// Phase 1's candidates made so far, of `generate_total` (0 until phase 1 starts).
+    pub generated: usize,
+    pub generate_total: usize,
+    /// Family C's runs made so far: the starts, then one per effort level.
+    pub converge_runs: usize,
+    /// The highest effort level of family C's runs made so far (0: the starts only).
+    pub effort_level: usize,
+    /// The candidates the routing phase will call (0 until it starts) ...
+    pub to_route: usize,
+    /// ... the calls that have ended and been judged ...
+    pub judged: usize,
+    /// ... and of those, the ones that routed.
+    pub routed: usize,
+}
+
+impl SearchProgress {
+    fn enter(&self, phase: SearchPhase) {
+        self.phase.store(phase as u8, Ordering::SeqCst);
+    }
+
+    /// One candidate made from `recipe`, by phase 1 or by family C.
+    fn made(&self, recipe: &Recipe) {
+        match &recipe.params {
+            Params::Converge(converge) => {
+                self.converge_runs.fetch_add(1, Ordering::SeqCst);
+                self.effort_level
+                    .fetch_max(converge.params.level as usize, Ordering::SeqCst);
+            }
+            _ => {
+                self.generated.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
+        let phase = match self.phase.load(Ordering::SeqCst) {
+            1 => SearchPhase::Generating,
+            2 => SearchPhase::Converging,
+            3 => SearchPhase::Routing,
+            4 => SearchPhase::Writing,
+            _ => SearchPhase::Starting,
+        };
+        ProgressSnapshot {
+            phase,
+            generated: self.generated.load(Ordering::SeqCst),
+            generate_total: self.generate_total.load(Ordering::SeqCst),
+            converge_runs: self.converge_runs.load(Ordering::SeqCst),
+            effort_level: self.effort_level.load(Ordering::SeqCst),
+            to_route: self.to_route.load(Ordering::SeqCst),
+            judged: self.judged.load(Ordering::SeqCst),
+            routed: self.routed.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// [`search_observed`] with no one asking.
+pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::Result<Outcome> {
+    search_observed(plan, routing, &SearchProgress::default()).await
+}
+
 /// The whole search of one board (flow steps 1 to 8): the held set and the intent,
 /// the model, the input's unrouted check, the references and phase 1, phase 1b (family
 /// C, `converge_all`) when the matrix has it, selection, then the routing phase one call
 /// at a time in `routing_order` while `may_route` allows (on `launch_elapsed`),
 /// each candidate's P gates and route result, the keys, and `search.json` and
 /// `table.md` in `plan.folder`. Errs only before phase 1 (a held set that cannot be
-/// proved, an input that does not parse); every later failure is a record.
-pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::Result<Outcome> {
+/// proved, an input that does not parse); every later failure is a record. `progress`
+/// is told each phase and each candidate as it is made or judged; it changes nothing
+/// the search does (the generator it counts through is the production one).
+pub(crate) async fn search_observed(
+    plan: &Plan,
+    routing: Arc<dyn RouteCall>,
+    progress: &SearchProgress,
+) -> anyhow::Result<Outcome> {
     let started = Instant::now();
+    let counted = |model: &BoardModel, recipe: &Recipe| {
+        let made = generate(model, recipe);
+        progress.made(recipe);
+        made
+    };
     let (model, schematic) = search_model(plan)?;
     std::fs::create_dir_all(plan.folder.join("candidates"))?;
 
@@ -1383,7 +1505,12 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
 
     // Phase 1.
     let first_id = records.len();
-    let mut generated = generate_all(&model, &recipes(&plan.matrix), plan.threads, first_id);
+    let phase_1 = recipes(&plan.matrix);
+    progress
+        .generate_total
+        .store(phase_1.len(), Ordering::SeqCst);
+    progress.enter(SearchPhase::Generating);
+    let mut generated = generate_all_with(&model, &phase_1, plan.threads, first_id, &counted);
     mark_duplicates(&mut generated, &earlier);
     records.extend(generated);
 
@@ -1393,8 +1520,16 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     let mut phase_1b = Duration::ZERO;
     if let Some((params, rule)) = &plan.matrix.converge {
         let phase_started = Instant::now();
-        let (mut converged, trace) =
-            converge_all(&model, &records, params, rule, plan.threads, records.len());
+        progress.enter(SearchPhase::Converging);
+        let (mut converged, trace) = converge_all_with(
+            &model,
+            &records,
+            params,
+            rule,
+            plan.threads,
+            records.len(),
+            &counted,
+        );
         mark_converge_duplicates(&model, &records, &mut converged);
         records.extend(converged);
         phase_1b = phase_started.elapsed();
@@ -1434,6 +1569,8 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
     }
 
     // Phase 3.
+    progress.to_route.store(order.len(), Ordering::SeqCst);
+    progress.enter(SearchPhase::Routing);
     let mut stopped_routing: Option<String> = None;
     let mut stopped_code: Option<&'static str> = None;
     let mut input_unrouted = BTreeMap::new();
@@ -1497,6 +1634,10 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             misses_in_a_row += 1;
         }
         file_judgement(&mut records[at], result, &input_unrouted);
+        progress.judged.fetch_add(1, Ordering::SeqCst);
+        if routed {
+            progress.routed.fetch_add(1, Ordering::SeqCst);
+        }
         if misses_in_a_row >= ROUTE_FAILURES_BEFORE_STOP && !any_routed {
             halted = true;
             stopped_routing = Some(format!(
@@ -1505,6 +1646,7 @@ pub(crate) async fn search(plan: &Plan, routing: Arc<dyn RouteCall>) -> anyhow::
             stopped_code = Some("calls_failed_in_a_row");
         }
     }
+    progress.enter(SearchPhase::Writing);
     assign_ranks(&mut records);
 
     let outcome = Outcome {

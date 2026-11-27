@@ -10,8 +10,16 @@
 //! through that tool only on the user's OK. Every value of the search is the bench's
 //! (T7); this module adds only the input side (the live board, KiCad's rules, the
 //! scratch project) and the output side (the winner, the response).
+//!
+//! A run outlives the call that starts it (Row AP2): the call reads the live board,
+//! claims it, makes the run folder and starts the search in the background through
+//! `crate::jobs`, then answers at once with a run id. A call with `run_id` reports the
+//! run's progress (`SearchProgress`) and, once it has ended, its whole result as the
+//! run wrote it to its folder (`result.json`), so a finished run can be read after the
+//! server has restarted.
 
 use crate::fastroute::{self, Binary, Located};
+use crate::jobs::{claim_board, run_folder_of, BoardClaim, Busy, JobKind, Jobs, Progress, Report};
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::place_converge::{ConvergeParams, OuterRule};
@@ -20,7 +28,8 @@ use crate::place_held::{sha256_hex, HoldRules};
 use crate::place_judge::RouteResult;
 use crate::place_route::{export_options, isolated_context, strip_routing, RouteInputs};
 use crate::place_search::{
-    rebuild, search, Outcome, PlaceRouteCall, Plan, Record, RouteCall, Routed,
+    rebuild, search_observed, Outcome, PlaceRouteCall, Plan, ProgressSnapshot, Record, RouteCall,
+    Routed, SearchProgress,
 };
 use crate::route_search::Effort;
 use crate::tool;
@@ -50,12 +59,30 @@ const MAX_LINES: usize = 8;
 /// The folder below Konnect's state folder that holds one run folder per call (T5).
 const PLANS_FOLDER: &str = "placement-plans";
 
+/// The tool's runs, as `crate::jobs` keeps them (Row AP2).
+pub(crate) const PLACEMENT_RUNS: JobKind = JobKind {
+    folder: PLANS_FOLDER,
+    tool: "plan_convergent_placement",
+};
+
+/// The `wait_s` a report suggests: under the client time limits seen so far (the
+/// owner's gave up at 1,800 s), and short enough that a stdio server, which answers one
+/// call at a time, is not held for long.
+const SUGGESTED_WAIT_S: u64 = 300;
+
 // ─── Tool definition ─────────────────────────────────────────────────────────
 
 pub(crate) fn tools() -> Vec<ToolDef> {
     vec![tool!(
         "plan_convergent_placement",
         "Plan a whole-board footprint placement with Konnect's convergent placement search. \
+         The search runs in the background: a call with `board` starts it and answers at \
+         once with `status: started` and a `run_id`. Call again with only `run_id` (and \
+         `wait_s`, up to 600, to wait for the end) for its progress (`status: running`, \
+         `phase`, `candidates`, `elapsed_s`) and, once it has ended, the whole result \
+         described below. One run per board at a time: a second start is refused and \
+         names the running id. A finished run's result stays in its run folder, so \
+         `run_id` reads it later too, after a server restart. \
          Read-only: nothing on the board changes. The board must be open in KiCad, and the \
          only board open: its live text and KiCad's own routing rules are read at the start \
          (twice, and both reads must agree). Every footprint KiCad marks locked stays where \
@@ -65,7 +92,8 @@ pub(crate) fn tools() -> Vec<ToolDef> {
          its stop rules end it (it stops when the cost stops falling, not after a time or a \
          count), and its first three candidates are routed with fastroute at `effort` \
          (default m, 240 s per call) and ranked by the placement bench's gates and rank \
-         key, so expect minutes (about 12 to 15 at m). The result's `apply_with` holds the \
+         key, so expect minutes (about 12 to 15 at m, more at h and xh). The finished \
+         result's `apply_with` holds the \
          winner as the exact arguments of set_component_placements; `winner` gives its \
          cost terms, its route numbers and the gates it fails, `candidates` one line per \
          routed candidate, `search` the stop rules, and `records` the run folder. \
@@ -75,19 +103,26 @@ pub(crate) fn tools() -> Vec<ToolDef> {
         json!({
             "type": "object",
             "properties": {
-                "board": { "type": "string", "description": "Path to the .kicad_pcb that is open in KiCad" },
+                "board": { "type": "string", "description": "Start a run: the path to the .kicad_pcb that is open in KiCad. Give either board or run_id." },
+                "run_id": { "type": "string", "description": "Report a run: the run_id its start returned. Give either board or run_id." },
+                "wait_s": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 600,
+                    "default": 0,
+                    "description": "With run_id only: wait up to this many seconds for the run to end before answering. Keep it under your MCP client's tool time limit; 300 suits a 30-minute limit."
+                },
                 "effort": {
                     "type": "string",
                     "enum": ["fast", "m", "h", "xh"],
                     "default": "m",
-                    "description": "The routing effort of each of the three ranking calls: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 2400 s."
+                    "description": "With board only. The routing effort of each of the three ranking calls: fast = 2 runs at once, m = 240 s, h = 720 s, xh = 2400 s."
                 },
                 "fastroute_path": {
                     "type": "string",
-                    "description": "The fastroute binary. Default as route_specctra_dsn: the environment variable KONNECT_FASTROUTE, else the user config key routing.fastroute_path, else a fastroute file next to the konnect executable, else ~/.local/share/fastroute/candidate/fastroute."
+                    "description": "With board only. The fastroute binary. Default as route_specctra_dsn: the environment variable KONNECT_FASTROUTE, else the user config key routing.fastroute_path, else a fastroute file next to the konnect executable, else ~/.local/share/fastroute/candidate/fastroute."
                 }
-            },
-            "required": ["board"]
+            }
         }),
         |args, ctx| async move { handle_plan_convergent_placement(args, ctx).await }
     )
@@ -104,8 +139,13 @@ async fn handle_plan_convergent_placement(
     args: &Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let call = match read_arguments(args) {
-        Ok(call) => call,
+    let call = match read_request(args) {
+        Ok(Request::Start(call)) => call,
+        Ok(Request::Report { run_id, wait }) => {
+            let state = konnect_sexp::writer::state_root()
+                .map_err(|error| anyhow::anyhow!("Konnect's state folder: {error}"))?;
+            return Ok(report_result(Jobs::global(), &state, &run_id, wait).await);
+        }
         Err(refusal) => return Ok(refusal),
     };
     let board = match call.board.canonicalize() {
@@ -128,7 +168,15 @@ async fn handle_plan_convergent_placement(
     };
     let state = konnect_sexp::writer::state_root()
         .map_err(|error| anyhow::anyhow!("Konnect's state folder: {error}"))?;
-    let folder = run_folder(&state, &live.text, &stamp())?;
+    let stamp = stamp();
+    let run_id = run_name(&live.text, &stamp);
+    // The claim comes before the run folder, so a refused start leaves nothing behind.
+    // The run keeps it until its result is written; a refusal below drops it.
+    let claim = match claim_board(&state, &PLACEMENT_RUNS, &board, &run_id)? {
+        Ok(claim) => claim,
+        Err(busy) => return Ok(busy_result(&busy)),
+    };
+    let folder = run_folder(&state, &live.text, &stamp)?;
     let binary = match locate_fastroute(call.fastroute_path.as_deref(), &folder).await? {
         Ok(binary) => binary,
         Err(refusal) => return Ok(refusal),
@@ -156,13 +204,68 @@ async fn handle_plan_convergent_placement(
         ctx: isolated,
     });
     let planned = Planned::of(&live_text)?;
-    let mut body = plan_and_judge(&plan, routing, &board, &planned).await?;
-    body["fastroute"] = json!({
+    let fastroute = json!({
         "path": binary.path.display().to_string(),
         "version": binary.version,
         "source": binary.source,
     });
+    let body = start_run(
+        Jobs::global(),
+        claim,
+        Background {
+            plan,
+            routing,
+            board,
+            planned,
+            fastroute,
+        },
+    )?;
     Ok(CallToolResult::json(&body))
+}
+
+/// A call either starts a run or reports one.
+#[derive(Debug, Clone, PartialEq)]
+enum Request {
+    Start(Call),
+    Report { run_id: String, wait: Duration },
+}
+
+/// `run_id` (with `wait_s`, whole seconds up to `jobs::MAX_WAIT`) reports a run; `board`
+/// (with `effort` and `fastroute_path`, as [`read_arguments`] reads them) starts one.
+/// Both, neither, or an argument of the other mode is refused.
+fn read_request(args: &Value) -> Result<Request, CallToolResult> {
+    let Some(run_id) = args.get("run_id") else {
+        if args.get("wait_s").is_some() {
+            return Err(invalid_arg(
+                "wait_s",
+                "goes with run_id only: a start answers at once",
+            ));
+        }
+        return read_arguments(args).map(Request::Start);
+    };
+    for other in ["board", "effort", "fastroute_path"] {
+        if args.get(other).is_some() {
+            return Err(invalid_arg(
+                other,
+                "goes with board only: give either board (to start a run) or run_id (to report one)",
+            ));
+        }
+    }
+    let run_id = run_id
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid_arg("run_id", "must be the run_id a start returned"))?;
+    let wait = match args.get("wait_s") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| *seconds <= crate::jobs::MAX_WAIT.as_secs())
+            .ok_or_else(|| invalid_arg("wait_s", "must be whole seconds from 0 to 600"))?,
+    };
+    Ok(Request::Report {
+        run_id: run_id.to_string(),
+        wait: Duration::from_secs(wait),
+    })
 }
 
 /// The arguments as the handler reads them.
@@ -305,13 +408,17 @@ fn stamp() -> String {
     format!("{}", since.as_millis())
 }
 
+/// The run's id, and its folder's name: `<stamp>-<12 hex of the text's SHA-256>`.
+pub(crate) fn run_name(text: &str, stamp: &str) -> String {
+    format!("{stamp}-{}", &sha256_hex(text.as_bytes())[..12])
+}
+
 /// A new folder `<state>/placement-plans/<stamp>-<12 hex of the text's SHA-256>/`.
 /// Errs when it is there already: no run writes into another's folder.
 pub(crate) fn run_folder(state: &Path, text: &str, stamp: &str) -> anyhow::Result<PathBuf> {
     let plans = state.join(PLANS_FOLDER);
     std::fs::create_dir_all(&plans).with_context(|| format!("create '{}'", plans.display()))?;
-    let digest = sha256_hex(text.as_bytes());
-    let folder = plans.join(format!("{stamp}-{}", &digest[..12]));
+    let folder = plans.join(run_name(text, stamp));
     std::fs::create_dir(&folder)
         .with_context(|| format!("create the run folder '{}'", folder.display()))?;
     Ok(folder)
@@ -439,18 +546,195 @@ impl Planned {
 
 /// The search of `plan` with `routing`, then the verdict and the response's body for the
 /// user's `board`. The search is awaited on this task: phases 1 and 1b are CPU work that
-/// runs inline (as in the bench), and a cancelled call drops the routing calls with it
+/// runs inline (as in the bench), and a dropped task drops the routing calls with it
 /// (their router processes are killed when dropped). The winner is rebuilt from the
-/// search's own model, never from a second read of the files.
+/// search's own model, never from a second read of the files. The synchronous form is
+/// kept for the tests only (Row AP2): the tool runs [`plan_and_judge_observed`] in the
+/// background.
+#[cfg(test)]
 pub(crate) async fn plan_and_judge(
     plan: &Plan,
     routing: Arc<dyn RouteCall>,
     board: &Path,
     planned: &Planned,
 ) -> anyhow::Result<Value> {
-    let outcome = search(plan, routing).await?;
+    plan_and_judge_observed(plan, routing, board, planned, &SearchProgress::default()).await
+}
+
+/// [`plan_and_judge`], telling `progress` where the search is.
+pub(crate) async fn plan_and_judge_observed(
+    plan: &Plan,
+    routing: Arc<dyn RouteCall>,
+    board: &Path,
+    planned: &Planned,
+    progress: &SearchProgress,
+) -> anyhow::Result<Value> {
+    let outcome = search_observed(plan, routing, progress).await?;
     let verdict = verdict_of(&outcome.model, &outcome)?;
     Ok(result_json(plan, &outcome, &verdict, board, planned))
+}
+
+// ─── The run in the background (Row AP2) ─────────────────────────────────────
+
+/// Everything a started run needs once the call that started it has answered.
+pub(crate) struct Background {
+    pub plan: Plan,
+    pub routing: Arc<dyn RouteCall>,
+    /// The user's board, as `apply_with` names it.
+    pub board: PathBuf,
+    pub planned: Planned,
+    /// The fastroute binary, as the result names it.
+    pub fastroute: Value,
+}
+
+/// A run's progress: the search's counts and the routing effort it ranks at.
+pub(crate) struct PlanProgress {
+    pub search: SearchProgress,
+    pub effort: &'static str,
+}
+
+impl Progress for PlanProgress {
+    fn snapshot(&self) -> Value {
+        progress_json(&self.search.snapshot(), self.effort)
+    }
+}
+
+/// The progress a report shows, and `run.json` keeps.
+pub(crate) fn progress_json(snapshot: &ProgressSnapshot, effort: &str) -> Value {
+    json!({
+        "phase": snapshot.phase.name(),
+        "candidates": {
+            "generated": snapshot.generated,
+            "generate_total": snapshot.generate_total,
+            "converge_runs": snapshot.converge_runs,
+            "to_route": snapshot.to_route,
+            "judged": snapshot.judged,
+            "routed": snapshot.routed,
+        },
+        "effort_level_reached": snapshot.effort_level,
+        "routing_effort": effort,
+    })
+}
+
+/// Start `run`'s search in the background under `claim` (the plan's folder is the run
+/// folder) and give the start's answer. The finished result is [`plan_and_judge`]'s body
+/// with the fastroute binary and the run id added: the body the call returned before
+/// runs went to the background, plus `run_id`.
+pub(crate) fn start_run(jobs: &Jobs, claim: BoardClaim, run: Background) -> anyhow::Result<Value> {
+    let Background {
+        plan,
+        routing,
+        board,
+        planned,
+        fastroute,
+    } = run;
+    let run_id = claim.run_id.clone();
+    let folder = plan.folder.clone();
+    let effort = plan.route.effort.name();
+    let progress = Arc::new(PlanProgress {
+        search: SearchProgress::default(),
+        effort,
+    });
+    let observed = Arc::clone(&progress);
+    let planned_from = json!({
+        "sha256": planned.sha256,
+        "routing_items": planned.routing_items,
+    });
+    let board_name = board.display().to_string();
+    let id = run_id.clone();
+    jobs.start(
+        &PLACEMENT_RUNS,
+        claim,
+        &board.clone(),
+        folder.clone(),
+        progress,
+        async move {
+            let mut body =
+                plan_and_judge_observed(&plan, routing, &board, &planned, &observed.search).await?;
+            body["fastroute"] = fastroute;
+            body["run_id"] = json!(id);
+            Ok(body)
+        },
+    )?;
+    let wait = format!("{{\"run_id\": \"{run_id}\", \"wait_s\": {SUGGESTED_WAIT_S}}}");
+    Ok(json!({
+        "status": "started",
+        "run_id": run_id,
+        "board": board_name,
+        "effort": effort,
+        "planned_from": planned_from,
+        "records": folder.display().to_string(),
+        "next_steps": [
+            format!("The search runs in the background (about 12 to 15 minutes at effort m, more at h and xh). Call plan_convergent_placement with {wait} until `status` is no longer `running`; keep wait_s under your client's tool time limit."),
+            "Meanwhile tell the user the run has started; start no other run on this board.",
+            "The finished result is the plan itself (`apply_with`, `winner.moves`, `winner.change`). It stays in the run folder, so the same call reads it later, after a server restart too.",
+        ],
+    }))
+}
+
+/// The refusal of a second start on a board that has a run.
+fn busy_result(busy: &Busy) -> CallToolResult {
+    CallToolResult::error(match &busy.run_id {
+        Some(id) => format!(
+            "A placement run is already running on this board: run {id}. Call plan_convergent_placement with {{\"run_id\": \"{id}\"}} for its progress and its result. One run per board at a time: nothing new was started."
+        ),
+        None => "A placement run is starting on this board. Call again in a few seconds: the refusal then names its run_id. One run per board at a time: nothing new was started.".to_string(),
+    })
+}
+
+/// The answer to a call with `run_id`, after waiting up to `wait` for the run to end.
+pub(crate) async fn report_result(
+    jobs: &Jobs,
+    state: &Path,
+    run_id: &str,
+    wait: Duration,
+) -> CallToolResult {
+    let folder = run_folder_of(state, &PLACEMENT_RUNS, run_id);
+    match jobs.report(state, &PLACEMENT_RUNS, run_id, wait).await {
+        Report::Done { result, .. } => CallToolResult::json(&result),
+        Report::Running {
+            record,
+            elapsed_s,
+            here,
+        } => {
+            let mut body = json!({
+                "status": "running",
+                "run_id": record.run_id,
+                "board": record.board,
+                "elapsed_s": round(elapsed_s, 1),
+                "records": folder.display().to_string(),
+            });
+            if let Some(progress) = record.progress.as_object() {
+                for (key, value) in progress {
+                    body[key] = value.clone();
+                }
+            }
+            if !here {
+                body["served_by_pid"] = json!(record.pid);
+                body["progress_as_of"] = json!(format!(
+                    "another Konnect process runs it and writes its progress every {} s",
+                    crate::jobs::PERSIST_EVERY.as_secs()
+                ));
+            }
+            body["next_steps"] = json!([format!(
+                "Still running: tell the user the phase and the counts, then call again with {{\"run_id\": \"{}\", \"wait_s\": {SUGGESTED_WAIT_S}}}.",
+                record.run_id
+            )]);
+            CallToolResult::json(&body)
+        }
+        Report::Failed { record } => CallToolResult::error(format!(
+            "Run {} failed: {}. Nothing was planned; its records are in '{}'.",
+            record.run_id,
+            record.error.as_deref().unwrap_or("no reason was recorded"),
+            folder.display()
+        )),
+        Report::Interrupted { record } => CallToolResult::error(format!(
+            "Run {} did not finish: the Konnect server that ran it stopped before it ended. Nothing was planned; its partial records are in '{}'. Start a new run with board.",
+            record.run_id,
+            folder.display()
+        )),
+        Report::Unknown { why } => invalid_arg("run_id", &why),
+    }
 }
 
 // ─── The verdict (T9, T10) ───────────────────────────────────────────────────

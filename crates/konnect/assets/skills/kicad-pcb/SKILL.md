@@ -272,7 +272,15 @@ an unproved outline is not completion evidence.
 - `plan_convergent_placement` (placement toolset) plans a whole board for a board
   open in KiCad: the parts locked in KiCad stay, the convergent search places the
   rest, and it routes its three best candidates to pick the winner (minutes). It
-  writes nothing. Show the user **winner**, **candidates** and **notes**; only on
+  writes nothing. It runs in the background: the call with `board` answers at once
+  with **status** `started` and a **run_id**. Then call it with only
+  `{"run_id": ..., "wait_s": 300}` (keep `wait_s` under your client's tool time
+  limit) and tell the user the **phase** and **candidates** counts each time, until
+  **status** is no longer `running`; that answer is the whole plan. A second start
+  on the same board is refused and names the running id: report that run instead.
+  The result stays in the run folder, so the same call reads it later, after a
+  server restart too; `interrupted` means the server stopped before the run ended,
+  so start a new one. Show the user **winner**, **candidates** and **notes**; only on
   their explicit OK call `create_checkpoint`, then `set_component_placements` with
   **apply_with.arguments** exactly as returned: the plan is legal as a whole, so it
   is the one plan applied in one batch instead of the small batches above. Then

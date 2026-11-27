@@ -8,6 +8,7 @@ pub(crate) mod freerouting_setup;
 pub mod gates;
 pub mod guidance;
 pub(crate) mod intent_width_report;
+pub(crate) mod jobs;
 pub mod kicad_install;
 pub(crate) mod layer_heights;
 pub(crate) mod length_probe;

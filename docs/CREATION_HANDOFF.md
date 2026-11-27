@@ -284,9 +284,9 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - Java 25 for Freerouting is at `/opt/homebrew/opt/openjdk@25/bin/java`; the system `java` is 11. The 2.5.0 JAR is at `~/.local/share/freerouting/2.5.0/freerouting-2.5.0.jar`. Both are on this Mac only.
 - The MCP server named `konnect` in an agent's tool list, Claude's or Codex's, runs the installed binary (`~/.local/share/konnect/bin/konnect`). A call to it never tests this checkout: use `target/release/konnect` by pipe ("Verify" in `docs/SIMULATION_HANDOFF.md`).
 
-## Row HS, the honest summaries (2026-11-27)
+## Row HS, the honest summaries (merged as #124, 2026-11-27)
 
-**Why.** A run on one of the owner's boards (2026-11-25) showed results that read as complete where parts were never checked. The routing status was `complete` with no length group defined. The search tried the pours both ways and nothing said which way won. The placement plan moved two parts by 0.25 mm and was presented as a plan. The owner chose this row first ("Yes, start A", 2026-11-27) from a ranked list of six fixes. The other five are not started: board safety (live-board warning, automatic checkpoints, a clear "board not open" error), `delete_all_routing` with a preview, asynchronous placement runs, netclass writes over IPC or a `width` argument, and one place + pours + route mode.
+**Why.** A run on one of the owner's boards (2026-11-25) showed results that read as complete where parts were never checked. The routing status was `complete` with no length group defined. The search tried the pours both ways and nothing said which way won. The placement plan moved two parts by 0.25 mm and was presented as a plan. The owner chose this row first ("Yes, start A", 2026-11-27) from a ranked list of six fixes. The other five: board safety (live-board warning, automatic checkpoints, a clear "board not open" error), `delete_all_routing` with a preview, asynchronous placement runs (Row AP2), netclass writes over IPC or a `width` argument, and one place + pours + route mode. B, C, D (Row AP2) and E started in parallel sessions on 2026-11-27; F comes last.
 
 **What changed** (additive only; `docs/API_MIGRATIONS.md` has the fields):
 - `route_specctra_dsn` (fastroute) has a top-level `summary`, in the result with a winner and in the one without. `summary.lengths` says whether the judge checked lengths. When it did not, it lists nets whose names read as pairs. `summary.pours` gives the run counts per shape, the winner's shape, and pours left out at the export. `completion.not_checked` is `["lengths"]` when nothing was checked. `length_matching` is still absent without a group (L15).
@@ -299,16 +299,19 @@ later routing-profile expansion; unsupported rule semantics refuse export.
 - `status` is unchanged. A new status value would break every reader of it, so the gap is named beside `status` instead.
 - `_H/_L` and `H/L` count only on CAN names, and `_A/_B` only on 485 names. Elsewhere they are often two separate signals (gate drives, encoder phases).
 
-**Verified** (commit `58fa74b3`; the gate after the last commit is recorded below):
+**State.** Merged as [#124](https://github.com/yuvaltal912-sys/Konnect/pull/124) on the owner's "Yes, merge" of 2026-11-27: main `9232b2b6`, a noreply merge of branch `claude/honest-route-summary` (head `3e2cb03e`).
+
+**Verified:**
 - Baseline gate on `c49ee383`: the nine commands under "Verify" in `docs/SIMULATION_HANDOFF.md` under both lane locks. Green: workspace tests 6020 passed, 0 failed, 188 ignored; `simulation_live` 95 passed; the other commands exit 0; installed Konnect SHA-256 `3de188bb775ab4ce…`.
 - Focused tests: `cargo test -p konnect-core --locked --lib -- fastroute route_judge route_lengths route_pairs route_search specctra placement_converge place_`: 1092 passed, 0 failed, 24 ignored. Also `cargo test -p konnect --locked --test asset_references --test schema_parameter_usage`: 12 and 5 passed (`asset_references` needed `likely_pairs` in `NOT_TOOLS`).
 - Negative controls: 32. One guard broken per run, its named test rerun. 31 were killed at once. One (a redundant clause of the turn normalisation) survived, so the clause was removed and its replacement control was killed.
 - Review: two rounds by an agent that did not write the code. Round 1: 0 blocker, 4 major, 5 minor, all fixed. Round 2: 0 blocker, 0 major, 3 minor, 2 fixed. The third (no test on the real no-winner path) was already covered: control D12 is killed by the `conclude` test.
 - `cargo mutants` and `cargo llvm-cov` were skipped: the change adds result fields and touches no validation, recovery or safety guard. The hand controls cover each new branch.
+- Final gate on `3e2cb03e`, the nine commands under "Verify" under both lane locks: green. Workspace tests 6035 passed, 0 failed, 188 ignored; doctests 9 passed; `simulation_live` 95 passed; the other commands exit 0.
 
 **Not verified.** A real route or placement run with the fork's binary, Windows, Linux. Known and left: with a mixed per-zone pour policy, an as-exported winner's line does not name the zones that were left out.
 
-**Next step.** The owner approves the exact PR title and body, then push to `fork` and open the PR. Done when the PR is open with that text.
+**Next step.** None: merged.
 
 ## Row K1, 1 Kopper: simulation off by default
 

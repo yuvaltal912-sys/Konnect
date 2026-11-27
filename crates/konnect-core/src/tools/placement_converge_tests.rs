@@ -5,8 +5,8 @@
 use super::*;
 use crate::place_generators::Family;
 use crate::place_held::tests::{board, pad, Fp, Shape};
-use crate::place_search::search_model;
 use crate::place_search::tests::{fake, good, quick, setup, small_matrix, Fake, Setup, Step};
+use crate::place_search::{search, search_model};
 use crate::tools::pcb_components::placements_applied_to;
 use konnect_ipc::types::IpcRoutingRules;
 use std::collections::BTreeMap;
@@ -54,8 +54,10 @@ fn the_tool_is_registered_live_only_in_the_placement_toolset_with_a_closed_schem
         .collect();
     assert_eq!(
         properties,
-        BTreeSet::from(["board", "effort", "fastroute_path"])
+        BTreeSet::from(["board", "effort", "fastroute_path", "run_id", "wait_s"])
     );
+    // Neither is required: a call gives board to start a run or run_id to report one.
+    assert!(tool.input_schema.get("required").is_none());
 }
 
 // ─── The live read (T3) ──────────────────────────────────────────────────────
@@ -732,4 +734,272 @@ fn a_plan_of_nudges_is_a_small_change_and_says_so_first() {
     // A real placement adds nothing.
     add_change_note(&mut notes, &mut steps, None);
     assert_eq!((notes.len(), steps.len()), (2, 2));
+}
+
+// ─── Runs in the background (Row AP2) ────────────────────────────────────────
+
+#[test]
+fn a_call_starts_a_run_with_board_or_reports_one_with_run_id_never_both() {
+    let start = read_request(&json!({"board": "/x/board.kicad_pcb", "effort": "h"})).unwrap();
+    assert!(matches!(
+        start,
+        Request::Start(Call {
+            effort: Effort::H,
+            ..
+        })
+    ));
+    let report = read_request(&json!({"run_id": "1-0123456789ab", "wait_s": 600})).unwrap();
+    assert_eq!(
+        report,
+        Request::Report {
+            run_id: "1-0123456789ab".into(),
+            wait: Duration::from_secs(600)
+        }
+    );
+    let report = read_request(&json!({"run_id": "1-0123456789ab"})).unwrap();
+    assert_eq!(
+        report,
+        Request::Report {
+            run_id: "1-0123456789ab".into(),
+            wait: Duration::ZERO
+        }
+    );
+    for args in [
+        json!({"run_id": "1-0123456789ab", "board": "/x/board.kicad_pcb"}),
+        json!({"run_id": "1-0123456789ab", "effort": "m"}),
+        json!({"run_id": "1-0123456789ab", "fastroute_path": "/bin/fr"}),
+        json!({"run_id": "1-0123456789ab", "wait_s": 601}),
+        json!({"run_id": "1-0123456789ab", "wait_s": -1}),
+        json!({"run_id": "1-0123456789ab", "wait_s": 1.5}),
+        json!({"run_id": ""}),
+        json!({"run_id": 7}),
+        json!({"board": "/x/board.kicad_pcb", "wait_s": 10}),
+        json!({}),
+    ] {
+        let refusal = read_request(&args).unwrap_err();
+        assert!(refusal.is_error, "{args}");
+    }
+}
+
+fn text_of(result: &CallToolResult) -> String {
+    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+        panic!("a text result");
+    };
+    text.clone()
+}
+
+fn body_of(result: &CallToolResult) -> Value {
+    serde_json::from_str(&text_of(result)).expect("a JSON result")
+}
+
+/// A router whose calls each wait for a permit, so a test sees the run mid-routing.
+struct Gated {
+    inner: Fake,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl RouteCall for Gated {
+    fn route(
+        &self,
+        id: usize,
+        board_text: String,
+        folder: PathBuf,
+    ) -> crate::route_search::BoxFuture<(RouteResult, crate::place_search::Timings)> {
+        let gate = Arc::clone(&self.gate);
+        let call = self.inner.route(id, board_text, folder);
+        Box::pin(async move {
+            let _permit = gate.acquire().await.unwrap();
+            call.await
+        })
+    }
+
+    fn unrouted(
+        &self,
+        board_text: String,
+        folder: PathBuf,
+    ) -> crate::route_search::BoxFuture<anyhow::Result<BTreeMap<String, usize>>> {
+        self.inner.unrouted(board_text, folder)
+    }
+}
+
+/// A run of `fast_plan` started in its own state folder, as the handler starts it.
+struct Started {
+    _state: tempfile::TempDir,
+    state: PathBuf,
+    jobs: Jobs,
+    run_id: String,
+    body: Value,
+}
+
+fn start_fast_run(setup: &Setup, routing: Arc<dyn RouteCall>, text: &str) -> Started {
+    let dir = tempfile::tempdir().unwrap();
+    let state = std::fs::canonicalize(dir.path()).unwrap();
+    let board = Path::new("/boards/board.kicad_pcb");
+    let stamp = "1700000000000";
+    let run_id = run_name(text, stamp);
+    let claim = claim_board(&state, &PLACEMENT_RUNS, board, &run_id)
+        .unwrap()
+        .unwrap();
+    let mut plan = fast_plan(setup);
+    plan.folder = run_folder(&state, text, stamp).unwrap();
+    let jobs = Jobs::default();
+    let body = start_run(
+        &jobs,
+        claim,
+        Background {
+            plan,
+            routing,
+            board: board.to_path_buf(),
+            planned: unrouted_board(),
+            fastroute: json!({ "path": "/fake/fastroute" }),
+        },
+    )
+    .unwrap();
+    Started {
+        _state: dir,
+        state,
+        jobs,
+        run_id,
+        body,
+    }
+}
+
+/// `body` without what differs between two runs of one plan: the run's id and binary,
+/// its wall times and its folder.
+fn without_run(mut body: Value) -> Value {
+    let object = body.as_object_mut().unwrap();
+    object.remove("run_id");
+    object.remove("fastroute");
+    object.remove("records");
+    body["search"]["elapsed_s"] = json!(0);
+    body["search"]["converge_s"] = json!(0);
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_run_gives_the_synchronous_result_and_keeps_it_for_a_restart() {
+    let setup = setup(1);
+    let synchronous = call(&fast_plan(&setup), Arc::new(fake(0, good))).await;
+    assert_eq!(synchronous["status"], "planned", "{synchronous:#}");
+
+    let run = start_fast_run(&setup, Arc::new(fake(0, good)), "board text");
+    assert_eq!(run.body["status"], "started");
+    assert_eq!(run.body["run_id"], run.run_id.as_str());
+    let folder = run_folder_of(&run.state, &PLACEMENT_RUNS, &run.run_id);
+    assert_eq!(run.body["records"], folder.display().to_string());
+    assert!(run.body["next_steps"][0]
+        .as_str()
+        .unwrap()
+        .contains(&format!("\"run_id\": \"{}\"", run.run_id)));
+
+    let done = report_result(&run.jobs, &run.state, &run.run_id, crate::jobs::MAX_WAIT).await;
+    assert!(!done.is_error);
+    let body = body_of(&done);
+    assert_eq!(body["run_id"], run.run_id.as_str());
+    assert_eq!(body["fastroute"], json!({ "path": "/fake/fastroute" }));
+    assert_eq!(body["records"], folder.display().to_string());
+    assert!(body["apply_with"]["arguments"]["placements"].is_array());
+    assert!(body["winner"]["moves"].is_array() && body["winner"]["change"].is_string());
+    assert_eq!(without_run(body.clone()), without_run(synchronous));
+
+    // A restarted server has no run in memory: the result is read from the folder.
+    let again = report_result(&Jobs::default(), &run.state, &run.run_id, Duration::ZERO).await;
+    assert_eq!(body_of(&again), body);
+    let file: Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(file, body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_run_reports_its_phase_counts_and_effort() {
+    let setup = setup(1);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let router = Gated {
+        inner: fake(0, good),
+        gate: Arc::clone(&gate),
+    };
+    let run = start_fast_run(&setup, Arc::new(router), "board text");
+    // Every route call waits at the gate, so the run stops in its routing phase.
+    let started = std::time::Instant::now();
+    let running = loop {
+        let report =
+            body_of(&report_result(&run.jobs, &run.state, &run.run_id, Duration::ZERO).await);
+        assert_eq!(report["status"], "running", "{report:#}");
+        if report["phase"] == "routing" {
+            break report;
+        }
+        assert!(started.elapsed() < Duration::from_secs(120), "{report:#}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let candidates = &running["candidates"];
+    let total = candidates["generate_total"].as_u64().unwrap();
+    assert!(total > 0, "{running:#}");
+    assert_eq!(candidates["generated"], total, "phase 1 is over");
+    assert!(candidates["converge_runs"].as_u64().unwrap() >= 1);
+    let to_route = candidates["to_route"].as_u64().unwrap();
+    assert!(
+        (1..=ROUTED_CANDIDATES as u64).contains(&to_route),
+        "{running:#}"
+    );
+    assert_eq!(candidates["judged"], 0);
+    assert_eq!(candidates["routed"], 0);
+    assert!(running["effort_level_reached"].is_u64());
+    assert_eq!(running["routing_effort"], "m");
+    assert!(running["elapsed_s"].as_f64().unwrap() > 0.0);
+    assert_eq!(running["run_id"], run.run_id.as_str());
+    assert_eq!(running["board"], "/boards/board.kicad_pcb");
+    assert!(running.get("served_by_pid").is_none());
+
+    // A second start on the same board is refused while it runs, and names it.
+    let busy = claim_board(
+        &run.state,
+        &PLACEMENT_RUNS,
+        Path::new("/boards/board.kicad_pcb"),
+        "1700000000001-0123456789ab",
+    )
+    .unwrap()
+    .unwrap_err();
+    let refusal = busy_result(&busy);
+    assert!(refusal.is_error);
+    assert!(text_of(&refusal).contains(&format!("run {}", run.run_id)));
+
+    gate.add_permits(64);
+    let done =
+        body_of(&report_result(&run.jobs, &run.state, &run.run_id, crate::jobs::MAX_WAIT).await);
+    assert_eq!(done["status"], "planned", "{done:#}");
+    // The last progress is kept with the run: every call judged, as the result counts.
+    let folder = run_folder_of(&run.state, &PLACEMENT_RUNS, &run.run_id);
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("run.json")).unwrap()).unwrap();
+    assert_eq!(record["state"], "done");
+    assert_eq!(record["progress"]["phase"], "writing");
+    assert_eq!(
+        record["progress"]["candidates"]["judged"],
+        done["search"]["routing_calls"]
+    );
+    assert_eq!(
+        record["progress"]["candidates"]["routed"],
+        done["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|line| line["outcome"] == "routed")
+            .count()
+    );
+    assert_eq!(
+        record["progress"]["effort_level_reached"],
+        done["search"]["effort_level_reached"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_names_what_it_cannot_read() {
+    let state = tempfile::tempdir().unwrap();
+    for id in ["../etc", "1700000000000-0123456789ab"] {
+        let report = report_result(&Jobs::default(), state.path(), id, Duration::ZERO).await;
+        assert!(report.is_error, "{id}");
+        let text = text_of(&report);
+        assert!(text.contains("run_id"), "{text}");
+    }
 }

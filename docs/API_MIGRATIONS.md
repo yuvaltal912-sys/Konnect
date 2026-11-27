@@ -3,6 +3,40 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
+## Unreleased: `plan_convergent_placement` runs in the background
+
+**A behaviour change.** A call with `board` no longer waits for the plan. It answers
+at once with `status: started`, a `run_id`, `board`, `effort`, `planned_from`,
+`records` (the run folder) and `next_steps`. Before, a run at effort h could outlast
+the MCP client's time limit (one took 2,155 s; the client gave up at 1,800 s), and
+its result was lost.
+
+- **New arguments:** `run_id` (report a run) and `wait_s` (with `run_id` only: wait
+  up to 0 to 600 s for the run to end; default 0). `board` is no longer required: a
+  call gives either `board` (with `effort` and `fastroute_path`) or `run_id` (with
+  `wait_s`), and any mix is refused.
+- **A running run** answers `status: running` with `run_id`, `board`, `elapsed_s`,
+  `phase` (`starting`, `generating`, `converging`, `routing`, `writing`),
+  `candidates` (`generated` of `generate_total`, `converge_runs`, `to_route`,
+  `judged`, `routed`), `effort_level_reached` (family C's effort level),
+  `routing_effort`, `records` and `next_steps`. A run of another Konnect process adds
+  `served_by_pid` and `progress_as_of`; its progress is the last one it wrote (every
+  10 s).
+- **A finished run** answers the whole result as before (`status` `planned`,
+  `planned_with_gate_failures`, `no_candidate` or `not_routed`, `apply_with`,
+  `winner.moves`, `winner.change`, ...) plus `run_id`. It is kept in the run folder
+  (`result.json`, beside `run.json`, the run's record), so the same call reads it
+  after a server restart, as long as the folder exists.
+- **Errors:** a failed run is an error result naming its reason; a run whose server
+  stopped before it ended is an error result that says `did not finish`
+  (interrupted). A second start on a board with a run is refused and names the
+  running `run_id`. An unknown or malformed `run_id` is an argument error.
+- **No synchronous mode** and no cancellation: no caller needs either, and a
+  cancel could not be shown to leave no router process behind without starting one.
+  A board's run ends by its own stop rules.
+- **Migration:** after a start, call again with `{"run_id": ..., "wait_s": 300}`
+  until `status` is not `running`, then read the result as before.
+
 ## Unreleased: the route and placement results say what they did not check
 
 Additive only: no argument changes, nothing removed or renamed, `status` unchanged.
