@@ -259,6 +259,24 @@ the wrapper's line. So 21 of the 22 unviable came from the shared target. The mi
 (`names_nets_in_place` in `konnect-sexp/src/net.rs` replaced with `true`) is a gap that is already
 on `main`, not something these scripts caused.
 
+**`cargo mutants` keeps its copies off the node's `/tmp`.** Each copy (a tree and its own target,
+several GB for `konnect-core`) goes under `TMPDIR`. On the node that was `/tmp`, local and about
+59 GB: at `--jobs 8` one PR's batch filled it, and 261 of 273 mutants read unviable with
+`No space left on device` (job 20938, 40 CPUs). The same two wrappers now set `TMPDIR` for a
+mutants process to `scratch/mutants-tmp` in the run's folder on the network home, and the step's
+log says `hpc: cargo mutants copies its trees under <folder>, not the node's /tmp`. Other cargo
+commands keep the node's `/tmp`. If the folder cannot be made, the step stops rather than fall back
+to `/tmp`. cargo-mutants removes its copies when it ends cleanly. `run-plan.sh` removes the folder
+when the job ends, and `prepare.sh` removes any that a killed run left before the next job.
+
+Two more lessons from the same day:
+- **Filter the tests.** Without a filter after `--`, the unmutated baseline runs the whole lib
+  suite, and on Linux it fails: 122 tests in job 20937, 107 of them in `tools::simulation` (no
+  simulator here), 7 in `simulation::worker_client` and 4 in `jobs::tests` (an open Linux finding
+  against #126). Give each batch the mutated modules' tests, as `-- --lib -- <filter>`.
+- **Ask for 32 to 40 CPUs.** An 80-CPU request (job 20932) stayed pending about 20 minutes and was
+  cancelled; 40 CPUs started at once.
+
 ### Commands
 
 ```bash
