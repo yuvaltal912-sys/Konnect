@@ -286,6 +286,7 @@ fn planned() -> Planned {
             pours: Some(PoursAnswer::Add),
             pour_roles: Some(RolesAnswer::AsNamed(AsNamed::AsNamed)),
             routing: Some(RoutingAnswer::ApplyIfComplete),
+            track_widths: Some(WidthsAnswer::Word(WidthsWord::AsProposed)),
         },
         start_approvals: Approvals::default(),
         effort: "m".to_string(),
@@ -622,11 +623,17 @@ async fn everything_approved_runs_the_writes_in_order_with_a_save_after_each() {
         "save_project",
         "checkpoint",
         "run_drc",
+        "audit_trace_current",
         "save_project",
     ];
     assert_eq!(fake.calls(), expected);
+    // Row TW: this plan has no current to record, so L5 is skipped (its own tests run it).
+    assert_eq!(
+        flow.record(Step::Widths).map(|r| r.state),
+        Some(StepState::Skipped)
+    );
     for record in &flow.records {
-        if record.step.writes() {
+        if record.step.writes() && record.step != Step::Widths {
             assert_eq!(record.state, StepState::Done, "{:?}", record.step);
             assert!(
                 record.after.is_some() && record.before.is_some() && record.checkpoint.is_some()
@@ -2213,4 +2220,492 @@ async fn an_interrupted_leg_stops_the_flow() {
         .unwrap();
     assert_eq!(flow.state, FlowState::Stopped);
     assert!(flow.stop_reason.unwrap().contains("stopped"));
+}
+
+// ─── Row TW: the track widths ────────────────────────────────────────────────
+
+/// [`planned`] with a width plan that proposes 1 A for 12V.
+fn planned_with_widths() -> Planned {
+    let mut planned = planned();
+    let attempt = attempt_folder(&planned.state, &planned.flow);
+    write_value(
+        &attempt.join(WIDTHS_FILE),
+        &json!({ "to_record": [{ "section": "currents", "net": "12V", "amps": 1.0 }] }),
+    )
+    .unwrap();
+    planned.flow.facts.widths_to_record = 1;
+    planned.flow.facts.widths_proposed_for = vec!["12V".to_string()];
+    planned.flow.nets.insert("12V".to_string());
+    save_flow(&planned.state, &planned.flow).unwrap();
+    planned
+}
+
+fn sent(fake: &Fake, tool: &str) -> Vec<Value> {
+    fake.sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == tool)
+        .map(|(_, args)| args.clone())
+        .collect()
+}
+
+/// TW-F1: L5 runs after the zones and before the export, with its checkpoint and save,
+/// and writes the proposed current to `currents` with the revision it read.
+#[tokio::test]
+async fn l5_records_the_confirmed_currents_before_the_export() {
+    let mut planned = planned_with_widths();
+    let fake = Fake::new();
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "absent", "revision": null, "intent": null })),
+    );
+    fake.script(
+        "set_design_intent",
+        ok(json!({ "status": "applied", "revision": "sha256:new" })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
+    let calls = fake.calls();
+    let at = |tool: &str| calls.iter().position(|c| c == tool).unwrap();
+    assert!(at("refill_zones") < at("get_design_intent"));
+    assert!(at("set_design_intent") < at("export_specctra_dsn"));
+    assert_eq!(calls[at("get_design_intent") - 1], "checkpoint");
+    assert_eq!(calls[at("set_design_intent") + 1], "save_project");
+    let writes = sent(&fake, "set_design_intent");
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0]["section"], "currents");
+    assert_eq!(writes[0]["expected_revision"], Value::Null);
+    assert_eq!(writes[0]["value"][0]["net"], "12V");
+    assert_eq!(writes[0]["value"][0]["max_current_a"], 1.0);
+    assert_eq!(
+        writes[0]["value"][0]["notes"],
+        crate::width_plan::RECORD_NOTE
+    );
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Done);
+    assert_eq!(record.counts, json!({ "currents": 1, "rails": 0 }));
+}
+
+/// TW-F2: a map answer writes the given current, a rail net on its rail, with the
+/// record's revision; the record's other sections are kept.
+#[tokio::test]
+async fn l5_writes_a_given_rail_current_on_its_rail() {
+    let mut planned = planned_with_widths();
+    planned.flow.approvals.track_widths = Some(WidthsAnswer::Map(
+        [("12V".to_string(), 2.5)].into_iter().collect(),
+    ));
+    save_flow(&planned.state, &planned.flow).unwrap();
+    let fake = Fake::new();
+    let intent = json!({ "schema_version": 1, "rails": [
+        { "name": "VIN", "nets": ["12V"], "voltage_v": 12.0 },
+        { "name": "LOGIC", "nets": ["3V3"], "voltage_v": 3.3 }
+    ]});
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "revision": "sha256:old", "intent": intent })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
+    let writes = sent(&fake, "set_design_intent");
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0]["section"], "rails");
+    assert_eq!(writes[0]["expected_revision"], "sha256:old");
+    assert_eq!(writes[0]["value"][0]["max_current_a"], 2.5);
+    assert_eq!(writes[0]["value"][1]["name"], "LOGIC");
+    assert!(writes[0]["value"][1].get("max_current_a").is_none());
+}
+
+/// TW-F3: `track_widths: skip` and a plan with nothing to record skip L5 with why.
+#[tokio::test]
+async fn l5_is_skipped_by_skip_and_when_nothing_is_to_record() {
+    let mut planned = planned_with_widths();
+    planned.flow.approvals.track_widths = Some(WidthsAnswer::Word(WidthsWord::Skip));
+    save_flow(&planned.state, &planned.flow).unwrap();
+    let fake = Fake::new();
+    let flow = leg(&mut planned, &fake).await;
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Skipped);
+    assert_eq!(record.why.as_deref(), Some("track_widths: skip"));
+    assert!(sent(&fake, "set_design_intent").is_empty());
+
+    let mut planned = self::planned();
+    let fake = Fake::new();
+    let flow = leg(&mut planned, &fake).await;
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Skipped);
+    assert!(record.why.as_deref().unwrap().contains("recorded already"));
+    assert!(sent(&fake, "get_design_intent").is_empty());
+}
+
+/// TW-F4: `already_done` reads L5 from the record: done only when every current is there.
+#[tokio::test]
+async fn already_done_reads_l5_from_the_design_intent() {
+    let planned = planned_with_widths();
+    let fake = Fake::new();
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "absent", "intent": null })),
+    );
+    assert!(
+        !already_done(Step::Widths, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+    // Another current recorded for the net since gate A wins: nothing is left to write.
+    let other =
+        json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 0.5 }] });
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "intent": other })),
+    );
+    assert!(
+        already_done(Step::Widths, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+    // A record that does not read is never "done".
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "intent": { "rails": 3 } })),
+    );
+    assert!(
+        !already_done(Step::Widths, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+    let there =
+        json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 1.0 }] });
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "intent": there })),
+    );
+    assert!(
+        already_done(Step::Widths, &planned.state, &planned.flow, &fake)
+            .await
+            .unwrap()
+    );
+}
+
+/// TW-F5: F4 runs `audit_trace_current` after the DRC and counts its findings; its
+/// refusal is a not-checked item, not a failed step.
+#[tokio::test]
+async fn f4_counts_the_current_audit_and_a_refusal_is_not_checked() {
+    let mut planned = planned();
+    let fake = Fake::new();
+    fake.script(
+        "audit_trace_current",
+        ok(json!({ "status": "checked", "nets": [{}, {}], "findings": [
+            { "severity": "error" }, { "severity": "warning" }, { "severity": "warning" }
+        ]})),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    let finish = flow.record(Step::Finish).unwrap();
+    assert_eq!(finish.state, StepState::Done);
+    assert_eq!(
+        finish.counts["trace_current"],
+        json!({ "status": "checked", "nets": 2, "errors": 1, "warnings": 2 })
+    );
+    assert!(flow_folder(&planned.state, &flow.flow_id)
+        .join(CURRENT_FILE)
+        .is_file());
+
+    let mut planned = self::planned();
+    let fake = Fake::new();
+    fake.script(
+        "audit_trace_current",
+        Called::Answered(CallToolResult::error("no board")),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    let finish = flow.record(Step::Finish).unwrap();
+    assert_eq!(finish.state, StepState::Done);
+    assert!(finish
+        .not_checked
+        .iter()
+        .any(|item| item.starts_with("audit_trace_current did not run")));
+}
+
+/// TW-F6: an answer whose map names a net with no pad, or a net the record holds a
+/// current for, is refused before anything changes.
+#[test]
+fn a_track_widths_answer_is_refused_against_the_board_and_the_record() {
+    let mut planned = planned_with_widths();
+    planned.flow.approvals.track_widths = None;
+    planned.flow.plan_revision = Some("rev".to_string());
+    planned.flow.gate = Some(Gate::Plan);
+    let answer = |map: &[(&str, f64)]| Approvals {
+        track_widths: Some(WidthsAnswer::Map(
+            map.iter().map(|(n, a)| (n.to_string(), *a)).collect(),
+        )),
+        ..Approvals::default()
+    };
+    let mut flow = planned.flow.clone();
+    let refused =
+        apply_answer(&mut flow, Gate::Plan, &answer(&[("NOPE", 1.0)]), "rev").unwrap_err();
+    assert!(
+        body_of(&refused).to_string().contains("no pad"),
+        "{refused:?}"
+    );
+    assert_eq!(flow.approvals.track_widths, None, "nothing changed");
+    let board = PathBuf::from(&planned.flow.board);
+    let path = crate::tools::design_intent::design_intent_path(board.parent().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 2.0 }] })
+            .to_string(),
+    )
+    .unwrap();
+    let refused = apply_answer(&mut flow, Gate::Plan, &answer(&[("12V", 1.0)]), "rev").unwrap_err();
+    assert!(
+        body_of(&refused).to_string().contains("design intent wins"),
+        "{refused:?}"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(apply_answer(&mut flow, Gate::Plan, &answer(&[("12V", 1.0)]), "rev").is_ok());
+}
+
+/// TW-F7: the width plan of a real board: the roles from the names, the record, the
+/// pours on the board, and the gate body's own keys.
+#[test]
+fn the_width_plan_of_the_public_fixture() {
+    let text = include_str!("../../tests/fixtures/specctra_pours_routing.kicad_pcb")
+        .replace("(net \"S1\")", "(net \"+12V\")");
+    let root = tempfile::tempdir().unwrap();
+    let board = root.path().join("board.kicad_pcb");
+    std::fs::write(&board, &text).unwrap();
+    let mut planned = planned();
+    planned.flow.board = board.display().to_string();
+    let rules: konnect_ipc::types::IpcEffectiveRoutingRules =
+        ["+12V", "GND", "S2", "S3", "S4", "S5", "S6"]
+            .into_iter()
+            .map(|net| {
+                (
+                    net.to_string(),
+                    konnect_ipc::IpcRoutingRules {
+                        class_name: "Default".into(),
+                        constituents: vec!["Default".into()],
+                        track_width_mm: Some(0.2),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                )
+            })
+            .collect();
+    let (plan, body) =
+        width_plan_of(&planned.flow, &board, &text, Some(&rules), BTreeSet::new()).unwrap();
+    assert_eq!(
+        plan.to_record,
+        vec![crate::width_plan::Record::Currents {
+            net: "+12V".into(),
+            amps: crate::width_plan::DEFAULT_SUPPLY_CURRENT_A
+        }]
+    );
+    assert!(plan
+        .not_sized
+        .iter()
+        .any(|n| n.net == "GND" && n.why.starts_with("poured")));
+    for key in ["sized", "not_sized", "classes", "to_record", "written_to"] {
+        assert!(body.get(key).is_some(), "{key}");
+    }
+    // Locked vias on the live board keep the class via, unless the answer deletes them.
+    let locked: BTreeSet<String> = ["+12V".to_string()].into_iter().collect();
+    let (kept, _) =
+        width_plan_of(&planned.flow, &board, &text, Some(&rules), locked.clone()).unwrap();
+    assert!(!kept.sized[0].via.changed);
+    let mut deleting = planned.flow.clone();
+    deleting.approvals.delete_routing = Some(DeleteAnswer::DeleteIncludingLocked);
+    let (changed, _) = width_plan_of(&deleting, &board, &text, Some(&rules), locked).unwrap();
+    assert!(changed.sized[0].via.changed);
+    // No rules: nothing sized, the proposal stands.
+    let (plan, _) = width_plan_of(&planned.flow, &board, &text, None, BTreeSet::new()).unwrap();
+    assert!(plan.sized.is_empty());
+    assert_eq!(plan.to_record.len(), 1);
+}
+
+/// TW-F8: the calls L5 and F4 make fit their tools' schemas.
+#[test]
+fn the_width_calls_match_their_tools_schemas() {
+    let valid = |tool: &str, args: &Value| {
+        let def = find_tool(tool).unwrap_or_else(|| panic!("{tool} is registered"));
+        if let Err(error) = def.input_validator.validate(args) {
+            panic!("{tool}: {args}: {error}");
+        }
+    };
+    valid("get_design_intent", &json!({ "project_dir": "/b" }));
+    valid(
+        "set_design_intent",
+        &json!({ "project_dir": "/b", "section": "currents", "value": [{ "net": "12V", "max_current_a": 1.0 }], "expected_revision": null }),
+    );
+    valid(
+        "audit_trace_current",
+        &json!({ "board": "/b/board.kicad_pcb" }),
+    );
+    let schema = schema();
+    let widths = &schema["properties"]["approve"]["properties"]["track_widths"];
+    assert!(widths.is_object(), "{schema}");
+    let def = find_tool("run_full_flow").unwrap();
+    for approve in [json!("as_proposed"), json!("skip"), json!({ "12V": 2.0 })] {
+        def.input_validator
+            .validate(
+                &json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": approve } }),
+            )
+            .unwrap();
+    }
+    for bad in [json!("yes"), json!({ "12V": 0 }), json!({ "12V": "two" })] {
+        assert!(
+            def.input_validator
+                .validate(
+                    &json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": bad } })
+                )
+                .is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn trace_current_counts_reads_the_findings() {
+    assert_eq!(
+        trace_current_counts(&json!({ "status": "no_design_intent", "findings": [] })),
+        json!({ "status": "no_design_intent", "nets": 0, "errors": 0, "warnings": 0 })
+    );
+}
+
+/// Review R1 major 1: a current recorded after gate A wins. A given current the record
+/// now holds stops L5 before any write; a proposal the record now covers is not written.
+#[tokio::test]
+async fn l5_refuses_a_given_current_the_record_now_holds_and_drops_a_stale_proposal() {
+    let mut planned = planned_with_widths();
+    planned.flow.approvals.track_widths = Some(WidthsAnswer::Map(
+        [("12V".to_string(), 2.0)].into_iter().collect(),
+    ));
+    save_flow(&planned.state, &planned.flow).unwrap();
+    let fake = Fake::new();
+    let now = json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 5.0 }] });
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "revision": "sha256:r", "intent": now })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Stopped);
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Failed);
+    assert!(record
+        .why
+        .as_deref()
+        .unwrap()
+        .contains("changed since gate A"));
+    assert!(sent(&fake, "set_design_intent").is_empty());
+
+    let mut planned = planned_with_widths();
+    let fake = Fake::new();
+    let now = json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 5.0 }] });
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "revision": "sha256:r", "intent": now })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
+    assert!(sent(&fake, "set_design_intent").is_empty(), "5 A stays");
+    assert_eq!(
+        flow.record(Step::Widths).unwrap().counts,
+        json!({ "currents": 0, "rails": 0 })
+    );
+}
+
+/// Review R1 major 2: with `pours: skip`, L5 writes the plan made without P4's zones.
+#[tokio::test]
+async fn l5_writes_the_unpoured_plan_when_the_pours_are_skipped() {
+    let mut planned = planned_with_widths();
+    let attempt = attempt_folder(&planned.state, &planned.flow);
+    write_value(
+        &attempt.join(WIDTHS_FILE),
+        &json!({
+            "to_record": [{ "section": "currents", "net": "12V", "amps": 1.0 }],
+            "if_pours_skipped": { "to_record": [
+                { "section": "currents", "net": "12V", "amps": 1.0 },
+                { "section": "currents", "net": "GND", "amps": 1.0 }
+            ]},
+        }),
+    )
+    .unwrap();
+    planned.flow.approvals.pours = Some(PoursAnswer::Skip);
+    planned.flow.facts.widths_to_record_unpoured = 2;
+    save_flow(&planned.state, &planned.flow).unwrap();
+    let fake = Fake::new();
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "absent", "revision": null, "intent": null })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    assert_eq!(flow.state, FlowState::Done, "{:?}", flow.stop_reason);
+    let writes = sent(&fake, "set_design_intent");
+    let nets: Vec<&str> = writes[0]["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["net"].as_str().unwrap())
+        .collect();
+    assert_eq!(nets, ["12V", "GND"]);
+    // With pours: add, the same file gives the plan with the zones: 12V only.
+    planned.flow.approvals.pours = Some(PoursAnswer::Add);
+    assert_eq!(
+        planned_records(
+            &planned.flow,
+            &read_json(&attempt.join(WIDTHS_FILE)).unwrap()
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+/// Review R1 minor 5: a record that does not read, or a plan file whose records do not,
+/// stops L5 instead of reading as "nothing recorded".
+#[tokio::test]
+async fn l5_stops_on_a_record_or_plan_that_does_not_read() {
+    let mut planned = planned_with_widths();
+    let fake = Fake::new();
+    fake.script(
+        "get_design_intent",
+        ok(json!({ "source": "file", "revision": "sha256:r", "intent": { "rails": 3 } })),
+    );
+    let flow = leg(&mut planned, &fake).await;
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Failed);
+    assert!(record.why.as_deref().unwrap().contains("does not read"));
+    assert!(sent(&fake, "set_design_intent").is_empty());
+
+    let mut planned = planned_with_widths();
+    let attempt = attempt_folder(&planned.state, &planned.flow);
+    write_value(
+        &attempt.join(WIDTHS_FILE),
+        &json!({ "to_record": "broken" }),
+    )
+    .unwrap();
+    let fake = Fake::new();
+    let flow = leg(&mut planned, &fake).await;
+    let record = flow.record(Step::Widths).unwrap();
+    assert_eq!(record.state, StepState::Failed);
+    assert!(sent(&fake, "get_design_intent").is_empty());
+}
+
+#[test]
+fn record_names_name_nets_and_rails() {
+    use crate::width_plan::Record;
+    assert_eq!(
+        record_names(&[
+            Record::Currents {
+                net: "12V".into(),
+                amps: 1.0
+            },
+            Record::Rails {
+                rail: "VIN".into(),
+                amps: 1.0
+            },
+        ]),
+        ["12V", "rail VIN"]
+    );
 }

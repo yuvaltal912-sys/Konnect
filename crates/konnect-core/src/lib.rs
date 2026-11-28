@@ -45,5 +45,6 @@ pub(crate) mod specctra_ses;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+pub(crate) mod width_plan;
 pub use jobs::stop_background_runs;
 pub(crate) mod zone_fill;

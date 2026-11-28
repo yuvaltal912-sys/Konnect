@@ -125,6 +125,7 @@ never replace an output, so a resume must not reuse one (FF14).
 | L2 | Old routing deleted | live | `delete_all_routing`: a fresh dry run whose counts must equal the approved counts (FF9), then the apply with its `plan_revision` | approved at A | yes (the start checkpoint) | nothing to delete, or `delete_routing: keep` |
 | L3 | Placement applied | live | `set_component_placements` with `apply_with` (B's guard checkpoints too) | approved at A | yes | `change: none`, or `placement: keep_current` |
 | L4 | Zones added | live | `add_zone` once per P4 proposal, then `refill_zones` | approved at A | yes | no proposal, or `pours: skip` |
+| L5 | Track widths recorded (Row TW) | project file | `get_design_intent`, then `set_design_intent` for `rails` and/or `currents` with its revision: the currents gate A confirmed (`docs/TRACK_WIDTH_PLAN_DESIGN.md`) | approved at A | yes | routing skipped, nothing to record, or `track_widths: skip` |
 | R1 | Export | live read | `export_specctra_dsn(board, output=<attempt>/board.dsn)` with the default `pours` (`fixed`) | no | no | routing skipped |
 | R2 | Route | scratch | `route_specctra_dsn` (fastroute, `effort`; B's pre-flight runs inside it). A result with no winner stops the flow at once (see "When a step fails") | no | no | as R1 |
 | R3 | Import check | live read | `plan_specctra_ses_import` | no | no | as R1 |
@@ -205,7 +206,8 @@ stays in the placement body only, for what it means there.
   "delete_routing": "delete" | "delete_including_locked" | "keep",
   "pours":          "add" | "skip",
   "pour_roles":     "as_named" | { "<net>": "ground" | "power" | "not_a_supply" },
-  "routing":        "apply_if_complete" | "apply_best" | "ask" | "skip"
+  "routing":        "apply_if_complete" | "apply_best" | "ask" | "skip",
+  "track_widths":   "as_proposed" | "skip" | { "<net>": <amps> }
 }
 ```
 
@@ -293,7 +295,7 @@ winner whatever its gates. `ask` always stops at gate B.
 
 ### Each live step
 
-L2 to L4 and F1 to F4 all run the same protocol:
+L2 to L5 and F1 to F4 all run the same protocol:
 
 1. **Intent first.** `flow.json` records the step as `calling`, with its arguments, before
    any call. A crash after this point leaves a record that says what may have happened.
@@ -339,7 +341,7 @@ On resume, each writing step first asks whether it is already done, from the boa
 | `Failed` at a live step | `stopped` | `done_so_far` (the steps before, saved); `way_back.start` and `way_back.before_step`, each as `restore_checkpoint`'s preview then its apply with `expected_revision`, with the board closed in KiCad first | `already_done`, else the step runs again when the board is at its `before` |
 | `MayHaveChanged`, or the server stopped during a call (D: `failed` with `STOPPED`, or `interrupted`; a blocking IPC write may still have landed) | `stopped`, `board_state: uncertain` | as above, plus "inspect the board in KiCad first" | `already_done`, else the step runs again only when the board is at its `before`, else refused: restore or abandon |
 | The step succeeded, and the save failed or did not verify | `stopped`, `board_state: unsaved` | the step's result, and that KiCad holds the change unsaved | the save alone is tried again |
-| R2 has no winner, or the route or judge errs | `stopped` | the route's own error. The board holds L2 to L4 and no routing. The result says so plainly, with `way_back.start` | allowed; starts again from R1 in a new attempt folder |
+| R2 has no winner, or the route or judge errs | `stopped` | the route's own error. The board holds L2 to L5 and no routing. The result says so plainly, with `way_back.start` | allowed; starts again from R1 in a new attempt folder |
 | `board_changed` | `stopped` | which `after` was expected, and what was found | refused; the user restores or abandons |
 
 - **No write is retried on its own.** An IPC drop after a write was sent cannot say whether
@@ -413,7 +415,7 @@ the flow folder, and the response names them.
 | Pre-flight, gate R | seconds | two live reads |
 | P2 and P4, each | under a minute to a few minutes | KiCad's refill and DRC with and without the proposals, up to two fills (PP16) |
 | P3, the placement search | 10 to over 30 minutes | Row CT: 729 s on the public fixture at `m`; over 30 minutes on one of the owner's boards at `h` (Row AP2) |
-| L2 to L4 | about a minute | IPC writes, refills, verified saves |
+| L2 to L5 | about a minute | IPC writes, refills, verified saves |
 | R1 to R3 | the effort's budget plus the judge: `m` 240 s, `h` 720 s, `xh` 1,320 s, each with several minutes of judging and pruning | Row BN |
 | F1 to F4 | a few minutes | the apply's candidate DRC, refills, stitching rounds |
 
@@ -554,7 +556,7 @@ impl Step {
     /// The design's id ("P0" … "F4") and a title for the summary.
     pub(crate) fn id(self) -> &'static str;
     pub(crate) fn title(self) -> &'static str;
-    /// Whether the step changes the live board or the project files: L2–L4, F1–F4. Each
+    /// Whether the step changes the live board or the project files: L2–L5, F1–F4. Each
     /// of these runs the live-step protocol.
     pub(crate) fn writes(self) -> bool;
 }
@@ -953,7 +955,7 @@ impl Progress for FlowProgress { fn snapshot(&self) -> Value; }
 /// folder. A writing step runs `live_step`. Returns its record.
 async fn run_step(step: Step, flow: &mut FlowRecord, caller: &dyn FlowCaller, ctx: &Arc<ToolContext>, progress: &FlowProgress) -> anyhow::Result<StepRecord>;
 
-/// The calls of one writing step. A fixed list for L2 to L4, F1, F3 and F4. A round
+/// The calls of one writing step. A fixed list for L2 to L5, F1, F3 and F4. A round
 /// closure for F2a and F2b, whose calls depend on the planner's answer.
 enum StepCalls {
     Fixed(Vec<(&'static str, Value)>),

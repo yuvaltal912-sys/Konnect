@@ -263,7 +263,12 @@ mod tests {
                         // against the board.
                         "plan_pours/properties/pour_roles/oneOf/1" |
                         "run_full_flow/properties/approve/properties/pour_roles/oneOf/1" |
-                        "run_full_flow/properties/answer/properties/pour_roles/oneOf/1"
+                        "run_full_flow/properties/answer/properties/pour_roles/oneOf/1" |
+                        // Row TW: net name to current (A). Its values are closed numbers
+                        // (0 < amps <= 100), and the handler checks every net against the
+                        // board and the design intent (`width_plan::answer_refusal`).
+                        "run_full_flow/properties/approve/properties/track_widths/oneOf/1" |
+                        "run_full_flow/properties/answer/properties/track_widths/oneOf/1"
                     ),
                         "unreviewed open input record: {path}"
                     );

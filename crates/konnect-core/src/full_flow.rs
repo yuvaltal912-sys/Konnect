@@ -45,6 +45,9 @@ pub(crate) enum Step {
     ApplyPlacement,
     #[serde(rename = "L4")]
     AddZones,
+    /// Row TW: the confirmed currents written to the design intent.
+    #[serde(rename = "L5")]
+    Widths,
     #[serde(rename = "R1")]
     Export,
     #[serde(rename = "R2")]
@@ -65,7 +68,7 @@ pub(crate) enum Step {
 
 impl Step {
     /// Every step, in the flow's order.
-    pub(crate) const ALL: [Step; 17] = [
+    pub(crate) const ALL: [Step; 18] = [
         Step::Preflight,
         Step::CountRouting,
         Step::PoursBefore,
@@ -75,6 +78,7 @@ impl Step {
         Step::DeleteRouting,
         Step::ApplyPlacement,
         Step::AddZones,
+        Step::Widths,
         Step::Export,
         Step::Route,
         Step::ImportCheck,
@@ -97,6 +101,7 @@ impl Step {
             Step::DeleteRouting => "L2",
             Step::ApplyPlacement => "L3",
             Step::AddZones => "L4",
+            Step::Widths => "L5",
             Step::Export => "R1",
             Step::Route => "R2",
             Step::ImportCheck => "R3",
@@ -120,6 +125,7 @@ impl Step {
             Step::DeleteRouting => "Old routing deleted",
             Step::ApplyPlacement => "Placement applied",
             Step::AddZones => "Zones added",
+            Step::Widths => "Track widths recorded",
             Step::Export => "Export",
             Step::Route => "Route",
             Step::ImportCheck => "Import check",
@@ -131,7 +137,7 @@ impl Step {
         }
     }
 
-    /// Whether the step changes the live board or the project files: L2–L4, F1–F4. Each
+    /// Whether the step changes the live board or the project files: L2–L5, F1–F4. Each
     /// of these runs the live-step protocol.
     pub(crate) fn writes(self) -> bool {
         matches!(
@@ -139,6 +145,7 @@ impl Step {
             Step::DeleteRouting
                 | Step::ApplyPlacement
                 | Step::AddZones
+                | Step::Widths
                 | Step::ApplySession
                 | Step::PlaneStitch
                 | Step::ReferenceVias
@@ -237,6 +244,40 @@ pub(crate) enum AsNamed {
     AsNamed,
 }
 
+/// Row TW: the answer about the width plan's currents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum WidthsAnswer {
+    /// `"as_proposed"` or `"skip"`.
+    Word(WidthsWord),
+    /// Net to current (A); every other proposed current is recorded as proposed.
+    Map(BTreeMap<String, f64>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WidthsWord {
+    /// Record every current the plan proposes.
+    AsProposed,
+    /// Record nothing: the nets whose current is recorded are still widened.
+    Skip,
+}
+
+impl WidthsAnswer {
+    /// The map, when the answer is one.
+    pub(crate) fn given(&self) -> Option<&BTreeMap<String, f64>> {
+        match self {
+            WidthsAnswer::Map(given) => Some(given),
+            WidthsAnswer::Word(_) => None,
+        }
+    }
+
+    /// Whether the answer records anything.
+    pub(crate) fn records(&self) -> bool {
+        *self != WidthsAnswer::Word(WidthsWord::Skip)
+    }
+}
+
 /// `approve`: every key optional; a missing key is asked at its gate.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +292,9 @@ pub(crate) struct Approvals {
     pub pour_roles: Option<RolesAnswer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingAnswer>,
+    /// Row TW: the width plan's currents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_widths: Option<WidthsAnswer>,
 }
 
 /// One key of `merged`: the old value, unless the answer sets it.
@@ -299,6 +343,12 @@ impl Approvals {
                 &answer.routing,
                 gate == Gate::Routing,
             )?,
+            track_widths: merge_key(
+                "track_widths",
+                &self.track_widths,
+                &answer.track_widths,
+                false,
+            )?,
         })
     }
 
@@ -314,6 +364,10 @@ impl Approvals {
                 .clone()
                 .or_else(|| self.pour_roles.clone()),
             routing: answer.routing.or(self.routing),
+            track_widths: answer
+                .track_widths
+                .clone()
+                .or_else(|| self.track_widths.clone()),
         }
     }
 
@@ -392,6 +446,38 @@ pub(crate) struct PlanFacts {
     /// P4 planned the pours on the search's winner (not on the current placement).
     #[serde(default)]
     pub p4_on_winner: bool,
+    /// Row TW: the currents the width plan proposes to record (its `to_record`), and the
+    /// nets they are for.
+    #[serde(default)]
+    pub widths_to_record: usize,
+    #[serde(default)]
+    pub widths_proposed_for: Vec<String>,
+    /// The same for the board without P4's zones: what L5 writes when the user answers
+    /// `pours: skip` (the nets those zones would pour carry their current on tracks).
+    #[serde(default)]
+    pub widths_to_record_unpoured: usize,
+    #[serde(default)]
+    pub widths_proposed_for_unpoured: Vec<String>,
+}
+
+impl PlanFacts {
+    /// Row TW: whether L5 writes the plan made without P4's zones: the zones are not
+    /// added (`pours` is not `add`, or none is proposed).
+    pub(crate) fn widths_unpoured(&self, approved: &Approvals) -> bool {
+        self.zones == 0 || approved.pours != Some(PoursAnswer::Add)
+    }
+
+    /// Row TW: the count of currents L5 writes for `approved`, and the names they are for.
+    pub(crate) fn widths_for(&self, approved: &Approvals) -> (usize, &[String]) {
+        if self.widths_unpoured(approved) {
+            (
+                self.widths_to_record_unpoured,
+                &self.widths_proposed_for_unpoured,
+            )
+        } else {
+            (self.widths_to_record, &self.widths_proposed_for)
+        }
+    }
 }
 
 impl PlanFacts {
@@ -427,7 +513,9 @@ fn placement_may_apply(facts: &PlanFacts, steps: &Steps, approved: &Approvals) -
 /// - `pours` when the plan proposes zones (recommended `add` when the fill check is clean,
 ///   else nothing: the user decides);
 /// - `routing` when the routing step runs (recommended `apply_if_complete`);
-/// - `pour_roles` when a role still comes from a name only (recommended `as_named`).
+/// - `pour_roles` when a role still comes from a name only (recommended `as_named`);
+/// - Row TW: `track_widths` when routing runs and the width plan proposes a current
+///   (recommended `as_proposed`).
 pub(crate) fn needs_at_plan(facts: &PlanFacts, steps: &Steps, approved: &Approvals) -> Vec<Need> {
     let mut needs = Vec::new();
     if let Some(need) = needs_roles(&facts.named_only, approved) {
@@ -480,6 +568,42 @@ pub(crate) fn needs_at_plan(facts: &PlanFacts, steps: &Steps, approved: &Approva
             key: "routing",
             recommended: Some(json!("apply_if_complete")),
             why: "The routed session is applied when every judge gate passes; the flow asks again only when one fails.".to_string(),
+        });
+    }
+    // Asked when the plan L5 would write proposes a current, or while the pours are not
+    // answered and either plan does: the pours answer, given in the same answer, then
+    // decides which plan L5 writes.
+    let (count, names) = facts.widths_for(approved);
+    // (With the pours open, `count` is already the plan without the zones.)
+    let undecided = approved.pours.is_none() && facts.zones > 0 && facts.widths_to_record > 0;
+    if approved.routing_runs(steps) && (count > 0 || undecided) && approved.track_widths.is_none() {
+        let names: &[String] = if count > 0 {
+            names
+        } else {
+            &facts.widths_proposed_for
+        };
+        let skipped_pours = if facts.zones > 0
+            && facts.widths_proposed_for_unpoured != facts.widths_proposed_for
+        {
+            if facts.widths_proposed_for_unpoured.is_empty() {
+                " With pours: skip it proposes none.".to_string()
+            } else {
+                format!(
+                    " With pours: skip it proposes one for {} instead, since the nets the zones would pour then carry their current on tracks.",
+                    facts.widths_proposed_for_unpoured.join(", ")
+                )
+            }
+        } else {
+            String::new()
+        };
+        needs.push(Need {
+            key: "track_widths",
+            recommended: Some(json!("as_proposed")),
+            why: format!(
+                "No current is recorded for {}: the width plan proposes {} A for each (a rail's current covers all its nets), a stated default, and sizes their tracks and vias for it.{skipped_pours} \"as_proposed\" records it in the design intent; a map {{net: amps}} gives the nets you name their real current; \"skip\" records nothing and routes them at their class width.",
+                names.join(", "),
+                crate::width_plan::DEFAULT_SUPPLY_CURRENT_A
+            ),
         });
     }
     needs
@@ -1055,6 +1179,27 @@ fn skip_reason(step: Step, flow: &FlowRecord) -> Option<String> {
                 None
             }
         }
+        Step::Widths => {
+            if !routing_runs {
+                Some(routing_skipped())
+            } else if facts.widths_for(approved).0 == 0
+                && approved
+                    .track_widths
+                    .as_ref()
+                    .and_then(WidthsAnswer::given)
+                    .is_none_or(BTreeMap::is_empty)
+            {
+                Some("every current the plan needs is recorded already".to_string())
+            } else if !approved
+                .track_widths
+                .as_ref()
+                .is_some_and(WidthsAnswer::records)
+            {
+                Some("track_widths: skip".to_string())
+            } else {
+                None
+            }
+        }
         Step::Export | Step::Route | Step::ImportCheck => (!routing_runs).then(routing_skipped),
         Step::ApplySession => {
             if !routing_runs {
@@ -1134,6 +1279,10 @@ pub(crate) fn counts_of(step: Step, result: &Value) -> Value {
             "placements": result["placements"].as_array().map_or(0, Vec::len)
         }),
         Step::AddZones => json!({ "zones": result["zones"].as_u64().unwrap_or(0) }),
+        Step::Widths => json!({
+            "currents": result["currents"].as_u64().unwrap_or(0),
+            "rails": result["rails"].as_u64().unwrap_or(0),
+        }),
         Step::ApplySession => {
             let mut counts = serde_json::Map::new();
             for key in ["tracks", "vias", "arcs", "imported", "applied"] {
@@ -1205,6 +1354,7 @@ fn line_of(record: &StepRecord) -> Option<String> {
             // reads, are not worth a line when skipped.
             Step::CountRouting
             | Step::PoursBefore
+            | Step::Widths
             | Step::Export
             | Step::ImportCheck
             | Step::PlaneStitch

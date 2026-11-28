@@ -82,6 +82,16 @@ pub(crate) fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
     k * rise_c.powf(DT_EXPONENT) * area_mil2.powf(AREA_EXPONENT)
 }
 
+/// What one via of `drill_mm` carries at `rise_c`, A: IPC-2221 on its plated barrel
+/// (`π · drill · plating`), as an inner conductor.
+pub(crate) fn via_capacity_a(drill_mm: f64, rise_c: f64) -> f64 {
+    capacity_a(
+        std::f64::consts::PI * drill_mm * VIA_PLATING_MM,
+        rise_c,
+        false,
+    )
+}
+
 pub(crate) fn is_outer(layer: &str) -> bool {
     layer == "F.Cu" || layer == "B.Cu"
 }
@@ -94,7 +104,7 @@ pub(crate) struct Requirement {
     pub rise_c: f64,
     rise_source: &'static str,
     /// `currents` or `rail:<name>`.
-    source: String,
+    pub(crate) source: String,
 }
 
 /// Copper thickness per copper layer, and where it came from.
@@ -301,9 +311,8 @@ fn audit_net(req: &Requirement, geometry: &BoardGeometry, copper: &Copper) -> (V
         .filter_map(|v| prop(v, "drill"))
         .fold(None::<f64>, |m, d| Some(m.map_or(d, |m: f64| m.min(d))))
         .map(|drill| {
-            let barrel = std::f64::consts::PI * drill * VIA_PLATING_MM;
-            let each = capacity_a(barrel, req.rise_c, false);
-            let needed = (req.amps / each).ceil() as usize;
+            let each = via_capacity_a(drill, req.rise_c);
+            let needed = crate::width_plan::vias_needed(req.amps, each);
             json!({
                 "count": vias.len(),
                 "smallest_drill_mm": r3(drill),
