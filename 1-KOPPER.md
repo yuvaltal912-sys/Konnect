@@ -73,7 +73,7 @@ Pull `main` and run `cargo xtask kopper-install` again.
 - macOS: fastroute runs only under `sandbox-exec`.
 - The Rust toolchain from `rust-toolchain.toml`, with Homebrew first on `PATH`.
 - KiCad at `/Applications/KiCad`: `kicad-cli` judges every route.
-- The fastroute build named in `packaging/1-kopper/fastroute.json` (x22 since Row ZR's stage ZR3) at
+- The fastroute build named in `packaging/1-kopper/fastroute.json` (x23-tn since Row TN) at
   `~/.local/share/fastroute/candidate/fastroute`, or named with `--fastroute <file>`.
   The install refuses a file whose SHA-256 is not the pinned one.
 - `claude` on `PATH`.

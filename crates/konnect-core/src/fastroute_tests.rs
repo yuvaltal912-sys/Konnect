@@ -107,7 +107,7 @@ fn the_search_switches_are_s1_f1_and_the_group_search_in_this_order() {
     for switch in SEARCH_SWITCHES {
         assert!(!CANDIDATE_SWITCHES.contains(switch), "{switch}");
     }
-    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR3");
+    assert_eq!(CANDIDATE_NAME, "C** + BR1 + W8P + GS + ZR3 + TN");
 }
 
 /// Row GS, G1: Full, Fallback and Polish each send every search switch once, right
@@ -3331,6 +3331,24 @@ int main(int argc, char **argv) {
             text.contains(&format!("names {ZONES_CUT_SWITCH}")),
             "{text}"
         );
+    }
+
+    /// Row TN: x22, without the serpentine switch, is refused by name.
+    #[tokio::test]
+    async fn probe_refuses_a_build_without_the_serpentine_switch_and_names_it() {
+        let fixture = Fixture::new("mode=candidate\nlacks=--x.serpentine\n");
+        let text = format!(
+            "{:#}",
+            probe(&fixture.binary, "argument", &fixture.scratch())
+                .await
+                .unwrap_err()
+        );
+        assert!(text.contains("names --x.serpentine"), "{text}");
+        // control: the same fake with the switch passes
+        let fixture = Fixture::new("mode=candidate\n");
+        assert!(probe(&fixture.binary, "argument", &fixture.scratch())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

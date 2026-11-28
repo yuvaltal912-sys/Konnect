@@ -69,7 +69,7 @@ fn the_repo_pin_parses() {
     )
     .unwrap();
     let pin = Pin::parse(&text).unwrap();
-    assert_eq!(pin.build, "x22");
+    assert_eq!(pin.build, "x23-tn");
     assert!(Pin::parse(&text.replace(&pin.sha256, "abc")).is_err());
     assert!(Pin::parse(&text.replace(&pin.sha256, &pin.sha256.to_uppercase())).is_err());
     assert!(Pin::parse("{}").is_err());
