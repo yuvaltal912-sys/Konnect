@@ -2509,6 +2509,15 @@ fn the_width_plan_of_the_public_fixture() {
     for key in ["sized", "not_sized", "classes", "to_record", "written_to"] {
         assert!(body.get(key).is_some(), "{key}");
     }
+    // Locked vias on the live board keep the class via, unless the answer deletes them.
+    let locked: BTreeSet<String> = ["+12V".to_string()].into_iter().collect();
+    let (kept, _) =
+        width_plan_of(&planned.flow, &board, &text, Some(&rules), locked.clone()).unwrap();
+    assert!(!kept.sized[0].via.changed);
+    let mut deleting = planned.flow.clone();
+    deleting.approvals.delete_routing = Some(DeleteAnswer::DeleteIncludingLocked);
+    let (changed, _) = width_plan_of(&deleting, &board, &text, Some(&rules), locked).unwrap();
+    assert!(changed.sized[0].via.changed);
     // No rules: nothing sized, the proposal stands.
     let (plan, _) = width_plan_of(&planned.flow, &board, &text, None, BTreeSet::new()).unwrap();
     assert!(plan.sized.is_empty());
@@ -2640,6 +2649,17 @@ async fn l5_writes_the_unpoured_plan_when_the_pours_are_skipped() {
         .map(|c| c["net"].as_str().unwrap())
         .collect();
     assert_eq!(nets, ["12V", "GND"]);
+    // With pours: add, the same file gives the plan with the zones: 12V only.
+    planned.flow.approvals.pours = Some(PoursAnswer::Add);
+    assert_eq!(
+        planned_records(
+            &planned.flow,
+            &read_json(&attempt.join(WIDTHS_FILE)).unwrap()
+        )
+        .unwrap()
+        .len(),
+        1
+    );
 }
 
 /// Review R1 minor 5: a record that does not read, or a plan file whose records do not,

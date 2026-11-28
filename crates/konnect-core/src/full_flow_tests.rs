@@ -1211,3 +1211,51 @@ fn track_widths_follows_the_pours_answer() {
     flow.approvals.pours = Some(PoursAnswer::Skip);
     assert_eq!(skip_reason(Step::Widths, &flow), None);
 }
+
+/// Mutants of `needs_at_plan`'s `track_widths` need (job 21032): no zones means one plan,
+/// so nothing is undecided; the question names the nets of the plan that applies, and
+/// mentions `pours: skip` only when there are zones and it changes the nets.
+#[test]
+fn the_track_widths_question_names_the_plan_that_applies() {
+    let mut open = all_approved();
+    open.track_widths = None;
+    open.pours = None;
+    let need = |facts: &PlanFacts| {
+        needs_at_plan(facts, &Steps::default(), &open)
+            .into_iter()
+            .find(|need| need.key == "track_widths")
+    };
+    let base = PlanFacts {
+        widths_to_record: 1,
+        widths_proposed_for: vec!["12V".to_string()],
+        widths_to_record_unpoured: 0,
+        widths_proposed_for_unpoured: Vec::new(),
+        ..facts()
+    };
+    // No zones: the plan without them is the only one, and it proposes nothing.
+    let no_zones = PlanFacts {
+        zones: 0,
+        ..base.clone()
+    };
+    assert!(need(&no_zones).is_none());
+    // Zones, the pours open: asked, naming the poured plan's nets.
+    let why = need(&base).unwrap().why;
+    assert!(why.contains("for 12V"), "{why}");
+    assert!(why.contains("With pours: skip it proposes none."), "{why}");
+    // Both plans name the same nets: no pours: skip sentence.
+    let same = PlanFacts {
+        widths_to_record_unpoured: 1,
+        widths_proposed_for_unpoured: vec!["12V".to_string()],
+        ..base.clone()
+    };
+    let why = need(&same).unwrap().why;
+    assert!(!why.contains("pours: skip"), "{why}");
+    // The unpoured plan applies (pours open) and proposes its own nets: they are named.
+    let other = PlanFacts {
+        widths_to_record_unpoured: 1,
+        widths_proposed_for_unpoured: vec!["GND".to_string()],
+        ..base.clone()
+    };
+    let why = need(&other).unwrap().why;
+    assert!(why.starts_with("No current is recorded for GND"), "{why}");
+}

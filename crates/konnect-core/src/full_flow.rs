@@ -574,9 +574,8 @@ pub(crate) fn needs_at_plan(facts: &PlanFacts, steps: &Steps, approved: &Approva
     // answered and either plan does: the pours answer, given in the same answer, then
     // decides which plan L5 writes.
     let (count, names) = facts.widths_for(approved);
-    let undecided = approved.pours.is_none()
-        && facts.zones > 0
-        && (facts.widths_to_record > 0 || facts.widths_to_record_unpoured > 0);
+    // (With the pours open, `count` is already the plan without the zones.)
+    let undecided = approved.pours.is_none() && facts.zones > 0 && facts.widths_to_record > 0;
     if approved.routing_runs(steps) && (count > 0 || undecided) && approved.track_widths.is_none() {
         let names: &[String] = if count > 0 {
             names
@@ -586,10 +585,14 @@ pub(crate) fn needs_at_plan(facts: &PlanFacts, steps: &Steps, approved: &Approva
         let skipped_pours = if facts.zones > 0
             && facts.widths_proposed_for_unpoured != facts.widths_proposed_for
         {
-            format!(
-                " With pours: skip it proposes one for {} instead, since the nets the zones would pour then carry their current on tracks.",
-                facts.widths_proposed_for_unpoured.join(", ")
-            )
+            if facts.widths_proposed_for_unpoured.is_empty() {
+                " With pours: skip it proposes none.".to_string()
+            } else {
+                format!(
+                    " With pours: skip it proposes one for {} instead, since the nets the zones would pour then carry their current on tracks.",
+                    facts.widths_proposed_for_unpoured.join(", ")
+                )
+            }
         } else {
             String::new()
         };

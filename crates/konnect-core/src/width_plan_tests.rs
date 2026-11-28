@@ -121,8 +121,10 @@ fn the_needed_width_is_the_narrowest_the_audit_passes() {
         assert!(at >= amps - 1e-9, "{amps} A: {width} mm carries {at}");
         assert!(below < amps, "{amps} A: {width} mm is not the narrowest");
     }
-    // 1 A on 1 oz outer copper at 10 °C: 0.30 mm.
-    let (one, _) = needed_width_mm(1.0, 10.0, &two_layers(), &copper);
+    // 1 A on 1 oz outer copper at 10 °C: 0.30 mm. Two layers of equal need: the first
+    // one names the limit.
+    let (one, limiting) = needed_width_mm(1.0, 10.0, &two_layers(), &copper);
+    assert_eq!(limiting, "F.Cu");
     assert!((one - 0.302).abs() < 0.002, "{one}");
 }
 
@@ -191,6 +193,11 @@ fn a_class_via_wider_than_the_power_via_is_kept() {
     assert!(!choice.changed);
     assert_eq!(choice.via, wide);
     assert!(choice.per_layer_change >= 2);
+    // A class via that already is the power via stays unchanged, however large the
+    // current.
+    let choice = via_for_current(3.0, 10.0, POWER_VIA);
+    assert!(!choice.changed);
+    assert_eq!(choice.via, POWER_VIA);
     // A wide class pad with a small drill keeps its diameter.
     let pad = ViaSize {
         diameter_mm: 1.2,
@@ -764,6 +771,150 @@ fn the_audit_and_the_plan_count_parallel_vias_alike() {
     let each = trace_current::via_capacity_a(0.3, 10.0);
     assert_eq!(vias_needed(each, each), 1);
     assert_eq!(vias_needed(each * 2.0, each), 2);
+}
+
+// ─── Mutants of job 21032: the gaps it found ─────────────────────────────────
+
+fn rules_with(net: &str, width: f64, via: ViaSize) -> IpcEffectiveRoutingRules {
+    let mut rules = rules();
+    let rule = rules.get_mut(net).unwrap();
+    rule.track_width_mm = Some(width);
+    rule.via_diameter_mm = Some(via.diameter_mm);
+    rule.via_drill_mm = Some(via.drill_mm);
+    rules
+}
+
+fn plan_with_rules(rules: &IpcEffectiveRoutingRules, map: &BTreeMap<String, f64>) -> WidthPlan {
+    let text = board();
+    let roles = roles(&[], &[]);
+    let poured = poured(&[]);
+    plan(&Inputs {
+        board_text: &text,
+        rules,
+        intent: None,
+        roles: &roles,
+        poured: &poured,
+        given: Some(map),
+        locked_vias: &BTreeSet::new(),
+    })
+    .unwrap()
+}
+
+/// A net joins the Power class when it is widened or gets the power via, either one;
+/// one that needs neither stays with its class. A net that is not widened names no
+/// narrow pad, even when its class width is wider than its pads.
+#[test]
+fn power_is_widened_or_a_new_via_and_only_then_are_pads_narrow() {
+    let in_power = |plan: &WidthPlan, net: &str| {
+        plan.classes
+            .iter()
+            .any(|c| c.name.starts_with("Power") && c.nets.iter().any(|n| n == net))
+    };
+    // Widened, the class via already the power via: Power, no via change.
+    let plan = plan_with_rules(&rules_with("12V", 0.2, POWER_VIA), &given(&[("12V", 1.0)]));
+    assert!(!sized(&plan, "12V").via.changed);
+    assert!(in_power(&plan, "12V"));
+    // Not widened (a 1.5 mm class), the via changed: Power; its 1 mm pads are not narrow.
+    let plan = plan_with_rules(&rules_with("12V", 1.5, CLASS), &given(&[("12V", 1.0)]));
+    let v12 = sized(&plan, "12V");
+    assert_eq!(v12.width_mm, 1.5);
+    assert!(v12.via.changed);
+    assert!(in_power(&plan, "12V"));
+    assert_eq!(v12.narrow_pads_total, 0, "not widened, so no pad is narrow");
+    assert!(!plan.notes.iter().any(|n| n.contains("neck-down")));
+    // Neither: stays with its class.
+    let plan = plan_with_rules(&rules_with("12V", 1.5, POWER_VIA), &given(&[("12V", 0.5)]));
+    assert!(!in_power(&plan, "12V"));
+    assert!(plan.classes.iter().all(|c| !c.name.starts_with("Power")));
+}
+
+/// The two notes appear exactly when they apply.
+#[test]
+fn the_notes_say_only_what_applies() {
+    let plan = plan_with_rules(&rules(), &given(&[("12V", 1.0)]));
+    assert_eq!(sized(&plan, "12V").via.per_layer_change, 1);
+    assert!(
+        !plan.notes.iter().any(|n| n.contains("several vias")),
+        "{:?}",
+        plan.notes
+    );
+    assert!(!plan.notes.iter().any(|n| n.contains("neck-down")));
+    let plan = plan_with_rules(&rules(), &given(&[("12V", 3.0)]));
+    assert!(sized(&plan, "12V").via.per_layer_change > 1);
+    assert!(plan.notes.iter().any(|n| n.contains("several vias")));
+}
+
+/// A supply the board has no pad for gets no proposal; a pair with one net on the board
+/// is still a pair.
+#[test]
+fn a_supply_without_a_pad_gets_no_proposal() {
+    let plan = plan_of(
+        None,
+        &roles(&["NOGND"], &["NOPE", "12V"]),
+        &poured(&[]),
+        None,
+    );
+    assert_eq!(
+        plan.to_record,
+        vec![Record::Currents {
+            net: "12V".into(),
+            amps: DEFAULT_SUPPLY_CURRENT_A
+        }]
+    );
+    let mut record = DesignIntent::empty();
+    record.interfaces.push(Interface {
+        name: "half".into(),
+        kind: "lvds".into(),
+        nets: vec!["S3".into(), "NOPE".into()],
+        differential_pairs: vec![DiffPair {
+            positive: "S3".into(),
+            negative: "NOPE".into(),
+            max_skew_mm: None,
+        }],
+        length_groups: Vec::new(),
+        single_ended_impedance_ohm: None,
+        differential_impedance_ohm: None,
+        notes: None,
+    });
+    let plan = plan_of(Some(&record), &roles(&[], &[]), &poured(&[]), None);
+    assert_eq!(plan.differential_pairs.len(), 1);
+}
+
+/// A rail proposed for one net and shared by another is a proposal for both, not the
+/// user's; the rail's siblings leave every other unsized supply where it is.
+#[test]
+fn a_shared_rail_proposal_stays_proposed_and_others_stay_unsized() {
+    let record = intent(json!({ "rails": [
+        { "name": "VIN", "nets": ["12V", "5V", "S5"], "voltage_v": 12.0 }
+    ]}));
+    let plan = plan_of(
+        Some(&record),
+        &roles(&["GND"], &["12V", "5V"]),
+        &poured(&["GND"]),
+        None,
+    );
+    for net in ["12V", "5V", "S5"] {
+        assert_eq!(sized(&plan, net).current_source, PROPOSED_SOURCE, "{net}");
+    }
+    assert!(
+        plan.not_sized.iter().any(|n| n.net == "GND"),
+        "{:?}",
+        plan.not_sized
+    );
+}
+
+/// `recorded` against a record that lacks the rail is never true.
+#[test]
+fn a_rail_record_the_intent_lacks_is_not_recorded() {
+    let record =
+        intent(json!({ "rails": [{ "name": "OTHER", "nets": ["5V"], "voltage_v": 5.0 }] }));
+    assert!(!recorded(
+        Some(&record),
+        &[Record::Rails {
+            rail: "VIN".into(),
+            amps: 1.0
+        }]
+    ));
 }
 
 // ─── Measurement (ignored: fastroute and kicad-cli) ──────────────────────────
