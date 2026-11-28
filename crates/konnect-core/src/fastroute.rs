@@ -4,12 +4,13 @@
 //! parallel runs keep their memory apart (docs/ROUTE_SEARCH_DESIGN.md, decision 2).
 //!
 //! The build Konnect runs is the candidate the owner chose on 2026-11-16
-//! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`])
-//! and the fill model of Row ZR, stages ZR1 to ZR3 (`--x.zones`, and from ZR3 its cut cost,
-//! [`ZONES_CUT_SWITCH`]): build x22. [`locate`] finds a
+//! (C** + BR1 + W8P), with the smart-router switches of Row GS ([`SEARCH_SWITCHES`]),
+//! the fill model of Row ZR, stages ZR1 to ZR3 (`--x.zones`, and from ZR3 its cut cost,
+//! [`ZONES_CUT_SWITCH`]), and Row TN's KiCad-like serpentines (`--x.serpentine`): build
+//! x23-tn. [`locate`] finds a
 //! binary and [`probe`] proves, before anything is routed, that it knows every
-//! experimental switch Konnect sends. That is not proof that it is x22: an earlier
-//! engine commit may know the same switches, and x18 to x22 all print
+//! experimental switch Konnect sends. That is not proof that it is x23-tn: an earlier
+//! engine commit may know the same switches, and x18 to x23-tn all print
 //! `fastroute 0.1.14`. What identifies the build is its SHA-256: the
 //! 1 Kopper package checks it against `packaging/1-kopper/fastroute.json`, and every
 //! result reports it as `engine.sha256`.
@@ -48,6 +49,7 @@ pub(crate) const CANDIDATE_SWITCHES: &[&str] = &[
     "--x.par_vias_net",
     "--x.par_vias_strict",
     "--x.par_via_each_a=0.8975",
+    "--x.serpentine",
 ];
 
 /// The smart-router switches (Row GS), sent on every routing pass after
@@ -68,12 +70,14 @@ pub(crate) fn routing_switches() -> Vec<&'static str> {
         .collect()
 }
 
-/// The candidate's name, as the research and the owner call it: build x22, the
-/// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`], and the
+/// The candidate's name, as the research and the owner call it: build x23-tn, the
+/// candidate C** + BR1 + W8P with the group search (GS) and [`SEARCH_SWITCHES`], the
 /// fill model of Row ZR, stages ZR1 to ZR3 (`--x.zones`: the model; from ZR2 the model as
 /// the engine's connectivity with the closing stage; from ZR3 the cut cost in the maze and
-/// the group search's "never more pour damage" rule).
-pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR3";
+/// the group search's "never more pour damage" rule), and Row TN (`--x.serpentine`, a
+/// [`CANDIDATE_SWITCHES`] entry, so the Tune pass sends it too: pair skew and length groups
+/// are tuned with KiCad-like serpentines).
+pub(crate) const CANDIDATE_NAME: &str = "C** + BR1 + W8P + GS + ZR3 + TN";
 
 /// Row ZR, stage ZR3: the cut cost's weights, sent with every `--x.zones` (never without
 /// it: the engine refuses a cut cost with no model). Per length (a share of the maze step's
@@ -275,7 +279,8 @@ fn present(path: &Path) -> bool {
 ///    `unknown experimental switch --x.konnect_probe_unknown` and must not name any
 ///    other switch as unknown. A build that lacks one of the switches names that one
 ///    (x18, without the search switches, names `--x.oct_bound`; x19, without the fill
-///    model, names `--x.zones=`; x21, without the cut cost, names `--x.zones_cut=`); a
+///    model, names `--x.zones=`; x21, without the cut cost, names `--x.zones_cut=`; x22,
+///    without Row TN's serpentines, names `--x.serpentine`); a
 ///    build without
 ///    experimental switches names none (it goes on to open the absent DSN and fails on
 ///    that).

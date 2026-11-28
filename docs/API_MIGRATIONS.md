@@ -4,6 +4,20 @@ Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
 
+## Unreleased: length tuning like KiCad's Tune Length (Row TN, fastroute x23-tn)
+
+`route_specctra_dsn` (fastroute) needs build x23-tn (`C** + BR1 + W8P + GS + ZR3 + TN`). No
+argument changes; the gates and the rank key do not change.
+
+- **A new candidate switch, `--x.serpentine`**, sent on every pass (routing passes and the Tune
+  pass), so `engine.switches` lists it after `--x.par_via_each_a=0.8975`, and the probe refuses
+  x22 by name. With it a pair's skew and a length group's nets are tuned with one regular
+  serpentine of equal 45-degree chamfered bumps on one long straight segment (a pair's on its
+  coupled run, away from the partner) instead of single bumps on short pieces; the older bumps
+  only take what the serpentines leave. Design: `docs/TN_DESIGN.md` in the fastroute source.
+- **`engine.candidate`** reads `C** + BR1 + W8P + GS + ZR3 + TN`.
+- A result's lengths, gates and fields are as before; only the copper of tuned nets differs.
+
 ## Unreleased: effort `xh` is 22 minutes
 
 A default change, no argument change. The `xh` routing budget of `route_specctra_dsn`
