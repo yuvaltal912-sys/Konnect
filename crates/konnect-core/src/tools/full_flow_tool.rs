@@ -1580,22 +1580,28 @@ async fn pours_after(
             .map_err(anyhow::Error::from)
             .and_then(|tree| crate::specctra::locked_via_nets(&tree))
             .unwrap_or_default();
-        let planned = width_plan_of(flow, &board, &text, rules.as_ref().ok(), live_locked.clone())
-            .and_then(|(plan, mut body)| {
-                let (unpoured, _) = if zones.is_empty() {
-                    (plan.clone(), Value::Null)
-                } else {
-                    width_plan_of(flow, &board, &base, rules.as_ref().ok(), live_locked)?
-                };
-                body["if_pours_skipped"] = json!({
-                    "to_record": unpoured.to_record,
-                    "sized": unpoured.sized.iter().map(|n| json!({
-                        "net": n.net, "current_a": n.current_a, "width_mm": n.width_mm,
-                        "via": n.via.via, "current_source": n.current_source,
-                    })).collect::<Vec<_>>(),
-                });
-                Ok((plan, unpoured, body))
+        let planned = width_plan_of(
+            flow,
+            &board,
+            &text,
+            rules.as_ref().ok(),
+            live_locked.clone(),
+        )
+        .and_then(|(plan, mut body)| {
+            let (unpoured, _) = if zones.is_empty() {
+                (plan.clone(), Value::Null)
+            } else {
+                width_plan_of(flow, &board, &base, rules.as_ref().ok(), live_locked)?
+            };
+            body["if_pours_skipped"] = json!({
+                "to_record": unpoured.to_record,
+                "sized": unpoured.sized.iter().map(|n| json!({
+                    "net": n.net, "current_a": n.current_a, "width_mm": n.width_mm,
+                    "via": n.via.via, "current_source": n.current_source,
+                })).collect::<Vec<_>>(),
             });
+            Ok((plan, unpoured, body))
+        });
         match planned {
             Ok((plan, unpoured, body)) => {
                 flow.facts.widths_to_record = plan.to_record.len();
@@ -1788,9 +1794,14 @@ fn width_plan_of(
     let tree = konnect_sexp::parse_sexp(text).map_err(|error| format!("{error:#}"))?;
     let poured = crate::specctra::pour_nets(&tree).map_err(|error| format!("{error:#}"))?;
     let empty = konnect_ipc::types::IpcEffectiveRoutingRules::new();
-    let given = flow.approvals.track_widths.as_ref().and_then(WidthsAnswer::given);
+    let given = flow
+        .approvals
+        .track_widths
+        .as_ref()
+        .and_then(WidthsAnswer::given);
     // The locked vias that stay: the live board's, unless the answer deletes them.
-    let locked_vias = if flow.approvals.delete_routing == Some(DeleteAnswer::DeleteIncludingLocked) {
+    let locked_vias = if flow.approvals.delete_routing == Some(DeleteAnswer::DeleteIncludingLocked)
+    {
         BTreeSet::new()
     } else {
         live_locked_vias
@@ -2476,7 +2487,10 @@ async fn step_work(
                     .await?
                 {
                     Ok(audit) => {
-                        write_value(&flow_folder(state, &flow.flow_id).join(CURRENT_FILE), &audit)?;
+                        write_value(
+                            &flow_folder(state, &flow.flow_id).join(CURRENT_FILE),
+                            &audit,
+                        )?;
                         work.counts["trace_current"] = trace_current_counts(&audit);
                     }
                     Err(Halt::Failed(why) | Halt::MayHaveChanged(why)) => work
@@ -2497,8 +2511,16 @@ async fn step_work(
 /// Row TW: F4's count of an `audit_trace_current` result: its status, the nets checked,
 /// and its findings by severity.
 pub(crate) fn trace_current_counts(audit: &Value) -> Value {
-    let findings = audit["findings"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let of = |severity: &str| findings.iter().filter(|f| f["severity"] == severity).count();
+    let findings = audit["findings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let of = |severity: &str| {
+        findings
+            .iter()
+            .filter(|f| f["severity"] == severity)
+            .count()
+    };
     json!({
         "status": audit["status"],
         "nets": audit["nets"].as_array().map_or(0, Vec::len),
@@ -2536,7 +2558,11 @@ async fn widths_work(
         Ok(intent) => intent,
         Err(why) => return Ok(Err(Halt::Failed(why))),
     };
-    let given = flow.approvals.track_widths.as_ref().and_then(WidthsAnswer::given);
+    let given = flow
+        .approvals
+        .track_widths
+        .as_ref()
+        .and_then(WidthsAnswer::given);
     // The record may have changed since the answer: a given current it now holds is
     // refused again, before anything is written.
     if let Some(reason) = given
@@ -2972,7 +2998,11 @@ async fn already_done(
                     let Ok(intent) = intent_of_read(&body_of(&result)) else {
                         return Ok(false);
                     };
-                    let given = flow.approvals.track_widths.as_ref().and_then(WidthsAnswer::given);
+                    let given = flow
+                        .approvals
+                        .track_widths
+                        .as_ref()
+                        .and_then(WidthsAnswer::given);
                     let records =
                         crate::width_plan::final_records(&proposed, given, intent.as_ref());
                     crate::width_plan::recorded(intent.as_ref(), &records)

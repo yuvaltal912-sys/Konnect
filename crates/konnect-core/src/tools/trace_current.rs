@@ -85,7 +85,11 @@ pub(crate) fn capacity_a(area_mm2: f64, rise_c: f64, external: bool) -> f64 {
 /// What one via of `drill_mm` carries at `rise_c`, A: IPC-2221 on its plated barrel
 /// (`π · drill · plating`), as an inner conductor.
 pub(crate) fn via_capacity_a(drill_mm: f64, rise_c: f64) -> f64 {
-    capacity_a(std::f64::consts::PI * drill_mm * VIA_PLATING_MM, rise_c, false)
+    capacity_a(
+        std::f64::consts::PI * drill_mm * VIA_PLATING_MM,
+        rise_c,
+        false,
+    )
 }
 
 pub(crate) fn is_outer(layer: &str) -> bool {

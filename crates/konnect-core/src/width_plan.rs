@@ -425,8 +425,7 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
         .collect();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for net in supplies {
-        if !seen.insert(net.as_str()) || !net_pads.contains_key(net) || currents.contains_key(net)
-        {
+        if !seen.insert(net.as_str()) || !net_pads.contains_key(net) || currents.contains_key(net) {
             continue;
         }
         let role = role_of(net);
@@ -449,9 +448,7 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
             .iter()
             .find(|old| record_key(old) == record_key(&proposed))
         {
-            Some(Record::Rails { amps, .. }) if given_rail(inputs, net) => {
-                (*amps, USER_SOURCE)
-            }
+            Some(Record::Rails { amps, .. }) if given_rail(inputs, net) => (*amps, USER_SOURCE),
             Some(Record::Rails { amps, .. }) | Some(Record::Currents { amps, .. }) => {
                 (*amps, PROPOSED_SOURCE)
             }
@@ -508,7 +505,8 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
             not_sized.push(NotSized {
                 net: net.clone(),
                 role,
-                why: "KiCad gave the net no complete routing rule (track width and via)".to_string(),
+                why: "KiCad gave the net no complete routing rule (track width and via)"
+                    .to_string(),
             });
             continue;
         };
@@ -539,7 +537,10 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
                 notes.push(format!(
                     "'{net}' keeps its class via: it has locked vias, which must equal its rule"
                 ));
-                kept(vias_needed(*amps, trace_current::via_capacity_a(drill, *rise)))
+                kept(vias_needed(
+                    *amps,
+                    trace_current::via_capacity_a(drill, *rise),
+                ))
             } else {
                 choice
             }
@@ -581,14 +582,18 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
         .collect();
     let mut groups: Vec<(f64, ViaSize, Vec<String>)> = Vec::new();
     for net in &power {
-        match groups.iter_mut().find(|(width, via, _)| {
-            (width - net.width_mm).abs() < 1e-9 && *via == net.via.via
-        }) {
+        match groups
+            .iter_mut()
+            .find(|(width, via, _)| (width - net.width_mm).abs() < 1e-9 && *via == net.via.via)
+        {
             Some((_, _, nets)) => nets.push(net.net.clone()),
             None => groups.push((net.width_mm, net.via.via, vec![net.net.clone()])),
         }
     }
-    groups.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.drill_mm.total_cmp(&b.1.drill_mm)));
+    groups.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then(a.1.drill_mm.total_cmp(&b.1.drill_mm))
+    });
     let numbered = groups.len() > 1;
     let mut classes: Vec<ClassRow> = groups
         .into_iter()
@@ -622,7 +627,10 @@ pub(crate) fn plan(inputs: &Inputs<'_>) -> Result<WidthPlan> {
         else {
             continue;
         };
-        let key = (rule.class_name.clone(), format!("{width:.4}/{diameter:.4}/{drill:.4}"));
+        let key = (
+            rule.class_name.clone(),
+            format!("{width:.4}/{diameter:.4}/{drill:.4}"),
+        );
         by_class
             .entry(key)
             .or_insert_with(|| ClassRow {
@@ -803,7 +811,8 @@ pub(crate) fn sections(
 /// Whether `intent` holds every one of `records` with its current: step L5 is done.
 pub(crate) fn recorded(intent: Option<&DesignIntent>, records: &[Record]) -> bool {
     let (rails, currents) = sections(intent, records);
-    rails.is_none() && currents.is_none()
+    rails.is_none()
+        && currents.is_none()
         && records.iter().all(|record| match record {
             Record::Rails { rail, .. } => {
                 intent.is_some_and(|i| i.rails.iter().any(|r| &r.name == rail))

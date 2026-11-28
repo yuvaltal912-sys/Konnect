@@ -1,13 +1,14 @@
 # Track widths in the full flow (Row TW): design
 
-**State, 2026-11-28.** Designed and built on branch `claude/trace-widths-e218f8` from
-`fork/main` `4b73f974`. Local until the owner approves the PR text. Real-board results stay
+**State, 2026-11-28.** Designed, built, reviewed twice and measured on branch
+`claude/trace-widths-e218f8` from `fork/main` `4b73f974`. The record of what was verified
+is in `docs/CREATION_HANDOFF.md`, "Row TW". Real-board results stay
 out of this note, apart from counts.
 
 ## Why
 
 On 2026-11-28 `run_full_flow` routed the owner's board at effort `xh`, and every track came
-out 0.2 mm, the 12 V, 5 V and I2C supply included. The board has only KiCad's Default
+out 0.2 mm, its supplies included. The board has only KiCad's Default
 netclass, and its design intent has no `rails` and no `currents`. Konnect never invents a
 rule, so every net was routed at Default. His words: "they can't all be the same width".
 

@@ -1134,11 +1134,12 @@ fn track_widths_reads_its_forms_and_is_set_once() {
     let skip = read(json!("skip"));
     let refused = map.merged(&skip, Gate::Plan).unwrap_err();
     assert!(refused.contains("track_widths"), "{refused}");
-    assert_eq!(map.merged(&map, Gate::Plan).unwrap(), map, "the same value again");
     assert_eq!(
-        Approvals::default().merged(&map, Gate::Plan).unwrap(),
-        map
+        map.merged(&map, Gate::Plan).unwrap(),
+        map,
+        "the same value again"
     );
+    assert_eq!(Approvals::default().merged(&map, Gate::Plan).unwrap(), map);
     assert!(WidthsAnswer::Word(WidthsWord::AsProposed).records());
     assert!(!WidthsAnswer::Word(WidthsWord::Skip).records());
 }
@@ -1179,18 +1180,34 @@ fn track_widths_follows_the_pours_answer() {
             .find(|need| need.key == "track_widths")
     };
     assert!(asked(&approved).is_none());
-    assert_eq!(facts.widths_for(&approved).0, 0, "pours: add writes nothing");
+    assert_eq!(
+        facts.widths_for(&approved).0,
+        0,
+        "pours: add writes nothing"
+    );
     // The pours not answered yet: asked, naming what pours: skip would write.
     let mut open = approved.clone();
     open.pours = None;
     let need = asked(&open).expect("asked while the pours are open");
     assert!(need.why.contains("pours: skip"), "{}", need.why);
+    // Review R2 C, the other side: only the plan with the zones proposes a current, and
+    // the pours are open: still asked, since pours: add would write it.
+    let mut poured_only = facts.clone();
+    poured_only.widths_to_record = 1;
+    poured_only.widths_proposed_for = vec!["12V".to_string()];
+    poured_only.widths_to_record_unpoured = 0;
+    poured_only.widths_proposed_for_unpoured = Vec::new();
+    assert!(needs_at_plan(&poured_only, &Steps::default(), &open)
+        .iter()
+        .any(|need| need.key == "track_widths"));
     approved.pours = Some(PoursAnswer::Skip);
     assert_eq!(facts.widths_for(&approved).0, 1);
     let mut flow = flow();
     flow.facts = facts;
     flow.approvals = all_approved();
-    assert!(skip_reason(Step::Widths, &flow).unwrap().contains("recorded already"));
+    assert!(skip_reason(Step::Widths, &flow)
+        .unwrap()
+        .contains("recorded already"));
     flow.approvals.pours = Some(PoursAnswer::Skip);
     assert_eq!(skip_reason(Step::Widths, &flow), None);
 }

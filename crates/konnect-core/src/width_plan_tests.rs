@@ -171,7 +171,11 @@ fn a_large_current_needs_vias_in_parallel() {
     let each = trace_current::via_capacity_a(0.4, 10.0);
     assert_eq!(choice.per_layer_change, (3.0 / each).ceil() as usize);
     assert!(choice.per_layer_change >= 3);
-    assert_eq!(vias_needed(2.0, 1.0), 2, "exactly 2 A over 1 A each is 2, not 3");
+    assert_eq!(
+        vias_needed(2.0, 1.0),
+        2,
+        "exactly 2 A over 1 A each is 2, not 3"
+    );
     assert_eq!(vias_needed(0.1, 1.0), 1);
     assert_eq!(vias_needed(1.0, 0.0), usize::MAX);
 }
@@ -207,7 +211,11 @@ fn an_unpoured_supply_gets_the_default_and_a_poured_one_does_not() {
     let v12 = sized(&plan, "12V");
     assert_eq!(v12.current_a, DEFAULT_SUPPLY_CURRENT_A);
     assert_eq!(v12.current_source, PROPOSED_SOURCE);
-    assert!(v12.width_mm > 0.29 && v12.width_mm < 0.32, "{}", v12.width_mm);
+    assert!(
+        v12.width_mm > 0.29 && v12.width_mm < 0.32,
+        "{}",
+        v12.width_mm
+    );
     assert_eq!(v12.via.via, POWER_VIA);
     assert_eq!(
         plan.to_record,
@@ -249,7 +257,12 @@ fn rail_nets_share_one_record_on_their_rail() {
     let record = intent(json!({ "rails": [
         { "name": "VIN", "nets": ["12V", "5V"], "voltage_v": 12.0 }
     ]}));
-    let plan = plan_of(Some(&record), &roles(&[], &["12V", "5V"]), &poured(&[]), None);
+    let plan = plan_of(
+        Some(&record),
+        &roles(&[], &["12V", "5V"]),
+        &poured(&[]),
+        None,
+    );
     assert_eq!(
         plan.to_record,
         vec![Record::Rails {
@@ -300,7 +313,11 @@ fn a_poured_net_keeps_its_class_width_and_via() {
     assert!(gnd.poured);
     assert_eq!(gnd.width_mm, 0.2);
     assert!(!gnd.via.changed);
-    assert!(gnd.needed_mm > 1.0, "the need is still shown: {}", gnd.needed_mm);
+    assert!(
+        gnd.needed_mm > 1.0,
+        "the need is still shown: {}",
+        gnd.needed_mm
+    );
 }
 
 /// G12: a differential pair gets no default even when its net reads as a supply.
@@ -323,7 +340,10 @@ fn a_differential_pair_gets_no_default() {
     });
     let plan = plan_of(Some(&record), &roles(&[], &["S3"]), &poured(&[]), None);
     assert!(plan.to_record.is_empty(), "{:?}", plan.to_record);
-    assert_eq!(plan.differential_pairs, vec![["S3".to_string(), "S4".to_string()]]);
+    assert_eq!(
+        plan.differential_pairs,
+        vec![["S3".to_string(), "S4".to_string()]]
+    );
 }
 
 /// G13: the pads narrower than a widened net's width are named; none for a net that is
@@ -343,7 +363,12 @@ fn pads_narrower_than_a_widened_net_are_named() {
 /// G14: the classes: one Power row for the widened nets, then the others by their class.
 #[test]
 fn the_classes_are_power_then_signal() {
-    let plan = plan_of(None, &roles(&["GND"], &["12V", "5V"]), &poured(&["GND"]), None);
+    let plan = plan_of(
+        None,
+        &roles(&["GND"], &["12V", "5V"]),
+        &poured(&["GND"]),
+        None,
+    );
     assert_eq!(plan.classes[0].name, "Power");
     assert_eq!(plan.classes[0].nets, vec!["12V", "5V"]);
     assert_eq!(plan.classes[0].via, POWER_VIA);
@@ -385,7 +410,11 @@ fn a_net_without_a_rule_is_not_sized() {
 fn a_recorded_net_the_board_lacks_is_noted() {
     let record = intent(json!({ "currents": [{ "net": "NOPE", "max_current_a": 1.0 }] }));
     let plan = plan_of(Some(&record), &roles(&[], &[]), &poured(&[]), None);
-    assert!(plan.notes.iter().any(|n| n.contains("'NOPE'")), "{:?}", plan.notes);
+    assert!(
+        plan.notes.iter().any(|n| n.contains("'NOPE'")),
+        "{:?}",
+        plan.notes
+    );
 }
 
 // ─── Answers and records ─────────────────────────────────────────────────────
@@ -401,15 +430,22 @@ fn a_track_widths_map_is_refused_for_each_reason() {
     let refused = |map: &[(&str, f64)]| answer_refusal(&given(map), &nets, Some(&record));
     assert!(refused(&[("NOPE", 1.0)]).unwrap().contains("no pad"));
     for amps in [0.0, -1.0, f64::NAN, f64::INFINITY, 100.5] {
-        assert!(refused(&[("S4", amps)]).unwrap().contains("above 0"), "{amps}");
+        assert!(
+            refused(&[("S4", amps)]).unwrap().contains("above 0"),
+            "{amps}"
+        );
     }
-    assert!(refused(&[("S3", 1.0)]).unwrap().contains("design intent wins"));
+    assert!(refused(&[("S3", 1.0)])
+        .unwrap()
+        .contains("design intent wins"));
     assert_eq!(
         refused(&[("S3", 0.2)]),
         None,
         "the same current recorded already (a resumed L5) is no conflict"
     );
-    assert!(refused(&[("12V", 1.0), ("5V", 2.0)]).unwrap().contains("one current"));
+    assert!(refused(&[("12V", 1.0), ("5V", 2.0)])
+        .unwrap()
+        .contains("one current"));
     assert_eq!(refused(&[("12V", 2.0), ("5V", 2.0), ("S4", 100.0)]), None);
 }
 
@@ -502,7 +538,11 @@ fn the_sections_keep_the_record_and_add_the_currents() {
     let rails = rails.unwrap();
     assert_eq!(rails[0].max_current_a, Some(1.0));
     assert_eq!(rails[0].notes.as_deref(), Some(RECORD_NOTE));
-    assert_eq!(rails[1].max_current_a, Some(0.3), "another rail is untouched");
+    assert_eq!(
+        rails[1].max_current_a,
+        Some(0.3),
+        "another rail is untouched"
+    );
     let currents = currents.unwrap();
     assert_eq!(
         currents.iter().map(|c| c.net.as_str()).collect::<Vec<_>>(),
@@ -555,9 +595,18 @@ fn the_export_gives_a_current_its_width_and_power_via() {
         ]}),
     );
     let (widened, report) = crate::specctra::widen_for_intent(&board, &text, &rules()).unwrap();
-    let plan = plan_of(None, &roles(&[], &[]), &poured(&[]), Some(&given(&[("12V", 1.0)])));
+    let plan = plan_of(
+        None,
+        &roles(&[], &[]),
+        &poured(&[]),
+        Some(&given(&[("12V", 1.0)])),
+    );
     let v12 = sized(&plan, "12V");
-    assert_eq!(widened["12V"].track_width_mm, Some(v12.width_mm), "the plan's width");
+    assert_eq!(
+        widened["12V"].track_width_mm,
+        Some(v12.width_mm),
+        "the plan's width"
+    );
     assert_eq!(widened["12V"].via_diameter_mm, Some(POWER_VIA.diameter_mm));
     assert_eq!(widened["12V"].via_drill_mm, Some(POWER_VIA.drill_mm));
     let row = report.iter().find(|r| r["net"] == "12V").unwrap();
@@ -605,7 +654,10 @@ fn a_net_with_locked_vias_keeps_its_via() {
     );
     let (widened, report) = crate::specctra::widen_for_intent(&board, &text, &rules()).unwrap();
     assert_eq!(widened["12V"].via_drill_mm, Some(0.3));
-    assert!(widened["12V"].track_width_mm.unwrap() > 0.29, "still widened");
+    assert!(
+        widened["12V"].track_width_mm.unwrap() > 0.29,
+        "still widened"
+    );
     let row = report.iter().find(|r| r["net"] == "12V").unwrap();
     assert!(row["via_kept_reason"].as_str().unwrap().contains("locked"));
     assert_eq!(row["vias_per_layer_change"], json!(2), "0.9 A each for 1 A");
@@ -617,15 +669,24 @@ fn a_net_with_locked_vias_keeps_its_via() {
 #[test]
 fn a_proposal_the_record_now_covers_is_dropped() {
     let proposed = vec![
-        Record::Currents { net: "12V".into(), amps: 1.0 },
-        Record::Currents { net: "5V".into(), amps: 1.0 },
+        Record::Currents {
+            net: "12V".into(),
+            amps: 1.0,
+        },
+        Record::Currents {
+            net: "5V".into(),
+            amps: 1.0,
+        },
     ];
     let record = intent(json!({
         "rails": [{ "name": "VIN", "nets": ["5V"], "voltage_v": 5.0, "max_current_a": 3.0 }],
         "currents": [{ "net": "12V", "max_current_a": 4.0 }]
     }));
     assert!(final_records(&proposed, None, Some(&record)).is_empty());
-    let rails = vec![Record::Rails { rail: "VIN".into(), amps: 1.0 }];
+    let rails = vec![Record::Rails {
+        rail: "VIN".into(),
+        amps: 1.0,
+    }];
     assert!(final_records(&rails, None, Some(&record)).is_empty());
 }
 
@@ -634,9 +695,15 @@ fn a_proposal_the_record_now_covers_is_dropped() {
 #[test]
 fn a_rail_with_its_own_rise_plans_the_width_the_export_routes() {
     let text = unpoured();
-    let rail = json!({ "name": "VIN", "nets": ["12V"], "voltage_v": 12.0, "max_temp_rise_c": 30.0 });
+    let rail =
+        json!({ "name": "VIN", "nets": ["12V"], "voltage_v": 12.0, "max_temp_rise_c": 30.0 });
     let before = intent(json!({ "rails": [rail.clone()] }));
-    let plan = plan_of(Some(&before), &roles(&[], &["12V"]), &poured(&[]), Some(&given(&[("12V", 3.0)])));
+    let plan = plan_of(
+        Some(&before),
+        &roles(&[], &["12V"]),
+        &poured(&[]),
+        Some(&given(&[("12V", 3.0)])),
+    );
     let v12 = sized(&plan, "12V");
     assert_eq!(v12.temp_rise_c, 30.0);
     let mut written = rail;
@@ -755,14 +822,11 @@ fn tw_measure_the_width_plan_at_effort_m() {
         .enumerate()
     {
         let source = Path::new(source);
-        let name = format!(
-            "{index}-{}",
-            source.file_stem().unwrap().to_string_lossy()
-        );
+        let name = format!("{index}-{}", source.file_stem().unwrap().to_string_lossy());
         let folder = root.join(&name);
         let base = crate::scratch_board::copy_project(source, &folder.join("source")).unwrap();
-        let text = crate::place_route::strip_routing(&std::fs::read_to_string(source).unwrap())
-            .unwrap();
+        let text =
+            crate::place_route::strip_routing(&std::fs::read_to_string(source).unwrap()).unwrap();
         std::fs::write(&base, &text).unwrap();
         // The pours, as P4 plans them.
         let pours = folder.join("pours");
@@ -813,14 +877,21 @@ fn tw_measure_the_width_plan_at_effort_m() {
             let dir = folder.join(variant);
             let board = crate::scratch_board::copy_project(&base, &dir.join("project")).unwrap();
             std::fs::write(&board, &zoned).unwrap();
-            let intent_path = crate::tools::design_intent::design_intent_path(board.parent().unwrap());
+            let intent_path =
+                crate::tools::design_intent::design_intent_path(board.parent().unwrap());
             let read_intent = || match crate::tools::design_intent::read_design_intent(&intent_path)
             {
                 crate::tools::design_intent::IntentRead::Loaded { intent, .. } => Some(*intent),
                 _ => None,
             };
-            let (nets, roles) =
-                crate::tools::pour_plan_tool::board_roles(&board, &zoned).unwrap();
+            let (nets, roles) = match crate::tools::pour_plan_tool::board_roles(&board, &zoned) {
+                Ok(read) => read,
+                Err(refusal) => {
+                    println!("TW {name}: refused: {refusal:?}");
+                    board_record.insert("refused".into(), json!(format!("{refusal:?}")));
+                    break;
+                }
+            };
             let roles = crate::pour_plan::with_roles(
                 &roles,
                 &as_named,
@@ -851,8 +922,11 @@ fn tw_measure_the_width_plan_at_effort_m() {
                     written.currents = currents;
                 }
                 std::fs::create_dir_all(intent_path.parent().unwrap()).unwrap();
-                std::fs::write(&intent_path, serde_json::to_string_pretty(&written).unwrap())
-                    .unwrap();
+                std::fs::write(
+                    &intent_path,
+                    serde_json::to_string_pretty(&written).unwrap(),
+                )
+                .unwrap();
             }
             let inputs = crate::place_route::RouteInputs {
                 options: crate::place_route::export_options(&board),
@@ -865,7 +939,17 @@ fn tw_measure_the_width_plan_at_effort_m() {
             };
             let candidate = dir.join("candidate");
             let started = std::time::Instant::now();
-            let dsn = crate::place_route::export_candidate(&inputs, &candidate, &zoned).unwrap();
+            let dsn = match crate::place_route::export_candidate(&inputs, &candidate, &zoned) {
+                Ok(dsn) => dsn,
+                Err(error) => {
+                    println!("TW {name} {variant}: export refused: {error:#}");
+                    board_record.insert(
+                        variant.to_string(),
+                        json!({ "export_refused": format!("{error:#}") }),
+                    );
+                    continue;
+                }
+            };
             let route = dir.join("route");
             std::fs::create_dir_all(&route).unwrap();
             let result = runtime.block_on(crate::place_route::route_candidate(
@@ -944,7 +1028,8 @@ fn tw_measure_the_width_plan_at_effort_m() {
                 );
                 let mut per_net = serde_json::Map::new();
                 for net in width_plan.sized.iter().map(|n| n.net.as_str()) {
-                    let on = |e: &&konnect_sexp::board_geometry::Entry| e.net.as_deref() == Some(net);
+                    let on =
+                        |e: &&konnect_sexp::board_geometry::Entry| e.net.as_deref() == Some(net);
                     let prop = |e: &konnect_sexp::board_geometry::Entry, k: &str| {
                         e.props.iter().find(|(key, _)| *key == k).map(|(_, v)| *v)
                     };
@@ -1002,6 +1087,12 @@ fn tw_measure_the_width_plan_at_effort_m() {
             board_record.insert(variant.to_string(), row);
         }
         record.insert(name, serde_json::Value::Object(board_record));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("tw.json"),
+            serde_json::to_string_pretty(&serde_json::Value::Object(record.clone())).unwrap(),
+        )
+        .unwrap();
     }
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(

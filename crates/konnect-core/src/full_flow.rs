@@ -470,7 +470,10 @@ impl PlanFacts {
     /// Row TW: the count of currents L5 writes for `approved`, and the names they are for.
     pub(crate) fn widths_for(&self, approved: &Approvals) -> (usize, &[String]) {
         if self.widths_unpoured(approved) {
-            (self.widths_to_record_unpoured, &self.widths_proposed_for_unpoured)
+            (
+                self.widths_to_record_unpoured,
+                &self.widths_proposed_for_unpoured,
+            )
         } else {
             (self.widths_to_record, &self.widths_proposed_for)
         }
@@ -574,8 +577,7 @@ pub(crate) fn needs_at_plan(facts: &PlanFacts, steps: &Steps, approved: &Approva
     let undecided = approved.pours.is_none()
         && facts.zones > 0
         && (facts.widths_to_record > 0 || facts.widths_to_record_unpoured > 0);
-    if approved.routing_runs(steps) && (count > 0 || undecided) && approved.track_widths.is_none()
-    {
+    if approved.routing_runs(steps) && (count > 0 || undecided) && approved.track_widths.is_none() {
         let names: &[String] = if count > 0 {
             names
         } else {
@@ -1185,7 +1187,11 @@ fn skip_reason(step: Step, flow: &FlowRecord) -> Option<String> {
                     .is_none_or(BTreeMap::is_empty)
             {
                 Some("every current the plan needs is recorded already".to_string())
-            } else if !approved.track_widths.as_ref().is_some_and(WidthsAnswer::records) {
+            } else if !approved
+                .track_widths
+                .as_ref()
+                .is_some_and(WidthsAnswer::records)
+            {
                 Some("track_widths: skip".to_string())
             } else {
                 None

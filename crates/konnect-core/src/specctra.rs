@@ -459,11 +459,13 @@ pub(crate) fn routing_layers(tree: &SexpNode) -> Result<Vec<String>> {
 /// Row TW: the nets that own a copper pour of the board, as the export reads its zones
 /// (rule areas and teardrops are not pours).
 pub(crate) fn pour_nets(tree: &SexpNode) -> Result<BTreeSet<String>> {
-    Ok(zones(tree, &top_level_net_table(tree), &copper_layers(tree)?)?
-        .into_iter()
-        .filter(|zone| zone.kind == ZoneKind::Plane)
-        .filter_map(|zone| zone.net)
-        .collect())
+    Ok(
+        zones(tree, &top_level_net_table(tree), &copper_layers(tree)?)?
+            .into_iter()
+            .filter(|zone| zone.kind == ZoneKind::Plane)
+            .filter_map(|zone| zone.net)
+            .collect(),
+    )
 }
 
 /// Row TW: the nets that have a locked via, as the export reads its locked routing.

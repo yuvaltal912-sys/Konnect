@@ -2292,8 +2292,9 @@ async fn l5_records_the_confirmed_currents_before_the_export() {
 #[tokio::test]
 async fn l5_writes_a_given_rail_current_on_its_rail() {
     let mut planned = planned_with_widths();
-    planned.flow.approvals.track_widths =
-        Some(WidthsAnswer::Map([("12V".to_string(), 2.5)].into_iter().collect()));
+    planned.flow.approvals.track_widths = Some(WidthsAnswer::Map(
+        [("12V".to_string(), 2.5)].into_iter().collect(),
+    ));
     save_flow(&planned.state, &planned.flow).unwrap();
     let fake = Fake::new();
     let intent = json!({ "schema_version": 1, "rails": [
@@ -2352,7 +2353,8 @@ async fn already_done_reads_l5_from_the_design_intent() {
             .unwrap()
     );
     // Another current recorded for the net since gate A wins: nothing is left to write.
-    let other = json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 0.5 }] });
+    let other =
+        json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 0.5 }] });
     fake.script(
         "get_design_intent",
         ok(json!({ "source": "file", "intent": other })),
@@ -2372,7 +2374,8 @@ async fn already_done_reads_l5_from_the_design_intent() {
             .await
             .unwrap()
     );
-    let there = json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 1.0 }] });
+    let there =
+        json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 1.0 }] });
     fake.script(
         "get_design_intent",
         ok(json!({ "source": "file", "intent": there })),
@@ -2403,7 +2406,9 @@ async fn f4_counts_the_current_audit_and_a_refusal_is_not_checked() {
         finish.counts["trace_current"],
         json!({ "status": "checked", "nets": 2, "errors": 1, "warnings": 2 })
     );
-    assert!(flow_folder(&planned.state, &flow.flow_id).join(CURRENT_FILE).is_file());
+    assert!(flow_folder(&planned.state, &flow.flow_id)
+        .join(CURRENT_FILE)
+        .is_file());
 
     let mut planned = self::planned();
     let fake = Fake::new();
@@ -2435,9 +2440,12 @@ fn a_track_widths_answer_is_refused_against_the_board_and_the_record() {
         ..Approvals::default()
     };
     let mut flow = planned.flow.clone();
-    let refused = apply_answer(&mut flow, Gate::Plan, &answer(&[("NOPE", 1.0)]), "rev")
-        .unwrap_err();
-    assert!(body_of(&refused).to_string().contains("no pad"), "{refused:?}");
+    let refused =
+        apply_answer(&mut flow, Gate::Plan, &answer(&[("NOPE", 1.0)]), "rev").unwrap_err();
+    assert!(
+        body_of(&refused).to_string().contains("no pad"),
+        "{refused:?}"
+    );
     assert_eq!(flow.approvals.track_widths, None, "nothing changed");
     let board = PathBuf::from(&planned.flow.board);
     let path = crate::tools::design_intent::design_intent_path(board.parent().unwrap());
@@ -2448,8 +2456,7 @@ fn a_track_widths_answer_is_refused_against_the_board_and_the_record() {
             .to_string(),
     )
     .unwrap();
-    let refused =
-        apply_answer(&mut flow, Gate::Plan, &answer(&[("12V", 1.0)]), "rev").unwrap_err();
+    let refused = apply_answer(&mut flow, Gate::Plan, &answer(&[("12V", 1.0)]), "rev").unwrap_err();
     assert!(
         body_of(&refused).to_string().contains("design intent wins"),
         "{refused:?}"
@@ -2469,22 +2476,23 @@ fn the_width_plan_of_the_public_fixture() {
     std::fs::write(&board, &text).unwrap();
     let mut planned = planned();
     planned.flow.board = board.display().to_string();
-    let rules: konnect_ipc::types::IpcEffectiveRoutingRules = ["+12V", "GND", "S2", "S3", "S4", "S5", "S6"]
-        .into_iter()
-        .map(|net| {
-            (
-                net.to_string(),
-                konnect_ipc::IpcRoutingRules {
-                    class_name: "Default".into(),
-                    constituents: vec!["Default".into()],
-                    track_width_mm: Some(0.2),
-                    clearance_mm: Some(0.2),
-                    via_diameter_mm: Some(0.6),
-                    via_drill_mm: Some(0.3),
-                },
-            )
-        })
-        .collect();
+    let rules: konnect_ipc::types::IpcEffectiveRoutingRules =
+        ["+12V", "GND", "S2", "S3", "S4", "S5", "S6"]
+            .into_iter()
+            .map(|net| {
+                (
+                    net.to_string(),
+                    konnect_ipc::IpcRoutingRules {
+                        class_name: "Default".into(),
+                        constituents: vec!["Default".into()],
+                        track_width_mm: Some(0.2),
+                        clearance_mm: Some(0.2),
+                        via_diameter_mm: Some(0.6),
+                        via_drill_mm: Some(0.3),
+                    },
+                )
+            })
+            .collect();
     let (plan, body) =
         width_plan_of(&planned.flow, &board, &text, Some(&rules), BTreeSet::new()).unwrap();
     assert_eq!(
@@ -2494,7 +2502,10 @@ fn the_width_plan_of_the_public_fixture() {
             amps: crate::width_plan::DEFAULT_SUPPLY_CURRENT_A
         }]
     );
-    assert!(plan.not_sized.iter().any(|n| n.net == "GND" && n.why.starts_with("poured")));
+    assert!(plan
+        .not_sized
+        .iter()
+        .any(|n| n.net == "GND" && n.why.starts_with("poured")));
     for key in ["sized", "not_sized", "classes", "to_record", "written_to"] {
         assert!(body.get(key).is_some(), "{key}");
     }
@@ -2518,21 +2529,30 @@ fn the_width_calls_match_their_tools_schemas() {
         "set_design_intent",
         &json!({ "project_dir": "/b", "section": "currents", "value": [{ "net": "12V", "max_current_a": 1.0 }], "expected_revision": null }),
     );
-    valid("audit_trace_current", &json!({ "board": "/b/board.kicad_pcb" }));
+    valid(
+        "audit_trace_current",
+        &json!({ "board": "/b/board.kicad_pcb" }),
+    );
     let schema = schema();
     let widths = &schema["properties"]["approve"]["properties"]["track_widths"];
     assert!(widths.is_object(), "{schema}");
     let def = find_tool("run_full_flow").unwrap();
     for approve in [json!("as_proposed"), json!("skip"), json!({ "12V": 2.0 })] {
         def.input_validator
-            .validate(&json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": approve } }))
+            .validate(
+                &json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": approve } }),
+            )
             .unwrap();
     }
     for bad in [json!("yes"), json!({ "12V": 0 }), json!({ "12V": "two" })] {
-        assert!(def
-            .input_validator
-            .validate(&json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": bad } }))
-            .is_err(), "{bad}");
+        assert!(
+            def.input_validator
+                .validate(
+                    &json!({ "board": "/b/board.kicad_pcb", "approve": { "track_widths": bad } })
+                )
+                .is_err(),
+            "{bad}"
+        );
     }
 }
 
@@ -2549,8 +2569,9 @@ fn trace_current_counts_reads_the_findings() {
 #[tokio::test]
 async fn l5_refuses_a_given_current_the_record_now_holds_and_drops_a_stale_proposal() {
     let mut planned = planned_with_widths();
-    planned.flow.approvals.track_widths =
-        Some(WidthsAnswer::Map([("12V".to_string(), 2.0)].into_iter().collect()));
+    planned.flow.approvals.track_widths = Some(WidthsAnswer::Map(
+        [("12V".to_string(), 2.0)].into_iter().collect(),
+    ));
     save_flow(&planned.state, &planned.flow).unwrap();
     let fake = Fake::new();
     let now = json!({ "schema_version": 1, "currents": [{ "net": "12V", "max_current_a": 5.0 }] });
@@ -2562,7 +2583,11 @@ async fn l5_refuses_a_given_current_the_record_now_holds_and_drops_a_stale_propo
     assert_eq!(flow.state, FlowState::Stopped);
     let record = flow.record(Step::Widths).unwrap();
     assert_eq!(record.state, StepState::Failed);
-    assert!(record.why.as_deref().unwrap().contains("changed since gate A"));
+    assert!(record
+        .why
+        .as_deref()
+        .unwrap()
+        .contains("changed since gate A"));
     assert!(sent(&fake, "set_design_intent").is_empty());
 
     let mut planned = planned_with_widths();
@@ -2635,7 +2660,11 @@ async fn l5_stops_on_a_record_or_plan_that_does_not_read() {
 
     let mut planned = planned_with_widths();
     let attempt = attempt_folder(&planned.state, &planned.flow);
-    write_value(&attempt.join(WIDTHS_FILE), &json!({ "to_record": "broken" })).unwrap();
+    write_value(
+        &attempt.join(WIDTHS_FILE),
+        &json!({ "to_record": "broken" }),
+    )
+    .unwrap();
     let fake = Fake::new();
     let flow = leg(&mut planned, &fake).await;
     let record = flow.record(Step::Widths).unwrap();
@@ -2648,8 +2677,14 @@ fn record_names_name_nets_and_rails() {
     use crate::width_plan::Record;
     assert_eq!(
         record_names(&[
-            Record::Currents { net: "12V".into(), amps: 1.0 },
-            Record::Rails { rail: "VIN".into(), amps: 1.0 },
+            Record::Currents {
+                net: "12V".into(),
+                amps: 1.0
+            },
+            Record::Rails {
+                rail: "VIN".into(),
+                amps: 1.0
+            },
         ]),
         ["12V", "rail VIN"]
     );
