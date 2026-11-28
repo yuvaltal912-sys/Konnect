@@ -70,6 +70,10 @@ const P2_FILE: &str = "p2-pours.json";
 const P3_FILE: &str = "p3-placement.json";
 const P4_FILE: &str = "p4-pours.json";
 const EXPORT_FILE: &str = "p4-export-check.json";
+/// Row TW: the width plan, made in P4 on the board the flow builds.
+const WIDTHS_FILE: &str = "p4-widths.json";
+/// Row TW: F4's `audit_trace_current`.
+const CURRENT_FILE: &str = "trace-current.json";
 /// The signature of the pours gate A showed (`pours_signature`).
 const P4_SIGNATURE_FILE: &str = "p4-signature.json";
 /// The route's result, in a route folder.
@@ -82,16 +86,19 @@ The board must be open in KiCad's PCB editor, alone, with no unsaved changes. A 
 placement_effort, fastroute_path, steps, approve) returns at once with a run_id; a report call (run_id, wait_s up to 600) \
 gives the progress and, at the end, the whole result. The flow first plans on scratch copies: Row CT's placement search \
 (plan_convergent_placement, its candidates routed at placement_effort), the pours on the board it would build \
-(plan_pours), and an export check of that board. Nothing on \
-the board changes before the plan is shown. It stops at a gate only where approve does not answer in advance: gate R asks \
+(plan_pours), an export check of that board, and the track widths (Row TW: each supply's current from the design \
+intent, else a stated 1 A default to confirm; its IPC-2221 width and via, as audit_trace_current computes them). \
+Nothing on the board changes before the plan is shown. It stops at a gate only where approve does not answer in advance: gate R asks \
 for pour_roles within seconds when a supply role comes only from a net's name; gate A shows the plan (parts that move, \
-the old routing that goes, the zones, the roles, the export check) and asks placement, delete_routing, pours and routing; \
+the old routing that goes, the zones, the roles, the export check, the track widths) and asks placement, delete_routing, \
+pours, routing and track_widths; \
 gate B asks again only when a judge gate of the route failed (routing apply_if_complete) or routing is ask. Answer a gate \
 with run_id, answer (the keys it needs; a plain yes is its answer_with, unchanged) and expected_plan_revision. Then the job \
 changes the live board one step at a time through the public tools (delete_all_routing, set_component_placements, \
-add_zone and refill_zones, export_specctra_dsn, route_specctra_dsn with fastroute at effort, plan_specctra_ses_import, \
+add_zone and refill_zones, set_design_intent for the confirmed currents, export_specctra_dsn (which widens each net with \
+a recorded current and gives it the power via when its class via cannot carry it), route_specctra_dsn with fastroute at effort, plan_specctra_ses_import, \
 apply_specctra_ses, the route's plane stitching and reference vias, its length rules with create_custom_drc_rule, then \
-run_drc with refill): before each writing step it checks that the saved board is where the step before left it and takes \
+run_drc with refill, then audit_trace_current): before each writing step it checks that the saved board is where the step before left it and takes \
 a checkpoint, and after it saves and checks the save. It never retries a write and never restores a checkpoint: a stopped \
 flow says why, what is done, and the restore_checkpoint arguments; resume: true continues once the board is where the \
 step left it, and abandon: true ends it, undoing nothing. The final result lists every step as done, skipped (with why) or \
@@ -147,7 +154,17 @@ fn approve_schema(description: &str) -> Value {
             "delete_routing": { "type": "string", "enum": ["delete", "delete_including_locked", "keep"] },
             "pours": { "type": "string", "enum": ["add", "skip"] },
             "pour_roles": crate::tools::pour_plan_tool::pour_roles_schema(),
-            "routing": { "type": "string", "enum": ["apply_if_complete", "apply_best", "ask", "skip"] }
+            "routing": { "type": "string", "enum": ["apply_if_complete", "apply_best", "ask", "skip"] },
+            "track_widths": {
+                "description": "Row TW: the width plan's currents. \"as_proposed\" records every proposed current in the design intent; \"skip\" records none; a map {net: amps} gives those nets that current (0 < amps <= 100) and records every other proposal as proposed. A net whose current the design intent records is refused: edit it with set_design_intent.",
+                "oneOf": [
+                    { "type": "string", "enum": ["as_proposed", "skip"] },
+                    {
+                        "type": "object",
+                        "additionalProperties": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+                    }
+                ]
+            }
         },
         "additionalProperties": false
     })
@@ -847,6 +864,9 @@ async fn preflight(
         },
         None => roles,
     };
+    if let Some(reason) = widths_refusal(call.approve.track_widths.as_ref(), board, &nets) {
+        return Ok(Err(invalid_arg("approve.track_widths", &reason)));
+    }
     let routing_items = Planned::of(&live.text)?.routing_items;
     Ok(Ok(Preflight {
         named_only: crate::pour_plan::named_only(&roles),
@@ -859,6 +879,34 @@ async fn preflight(
             .map(|(net, role)| (net, role.to_string()))
             .collect(),
     }))
+}
+
+/// Row TW: the project's design-intent record (`None` when there is none), or why it
+/// cannot be used.
+fn intent_of(board: &Path) -> Result<Option<crate::tools::design_intent::DesignIntent>, String> {
+    use crate::tools::design_intent::{design_intent_path, read_design_intent, IntentRead};
+    let dir = board.parent().unwrap_or(Path::new("."));
+    match read_design_intent(&design_intent_path(dir)) {
+        IntentRead::Absent => Ok(None),
+        IntentRead::Loaded { intent, .. } => Ok(Some(*intent)),
+        IntentRead::Unusable { reason } => Err(format!(
+            "the design-intent record cannot be used ({reason})"
+        )),
+    }
+}
+
+/// Row TW: why a `track_widths` map is refused (`width_plan::answer_refusal`, against the
+/// record as it is now), or `None`.
+fn widths_refusal(
+    answer: Option<&WidthsAnswer>,
+    board: &Path,
+    nets: &BTreeSet<String>,
+) -> Option<String> {
+    let given = answer?.given()?;
+    match intent_of(board) {
+        Ok(intent) => crate::width_plan::answer_refusal(given, nets, intent.as_ref()),
+        Err(why) => Some(why),
+    }
 }
 
 /// The start: the pre-flight, the marker, the flow folder, fastroute located into it,
@@ -1510,13 +1558,75 @@ async fn pours_after(
     // Locked routing kept on a net of a part that moves (conservative: by net).
     flow.facts.locked_on_moved = locked_on_moved(&live, &folder.join(P3_FILE));
     flow.facts.export_refused = None;
+    flow.facts.widths_to_record = 0;
+    flow.facts.widths_proposed_for.clear();
+    flow.facts.widths_to_record_unpoured = 0;
+    flow.facts.widths_proposed_for_unpoured.clear();
     if flow.steps_asked.routing == RunOrSkip::Run {
         let text = if zones.is_empty() {
             base.clone()
         } else {
             crate::pour_plan::with_zones(&base, &zones)?
         };
-        match export_check(ctx, &board, &live, &text, &folder).await? {
+        let rules = match live_input(ctx, &board).await? {
+            Ok(live) => Ok(live.rules),
+            Err(refusal) => Err(short(&body_of(&refusal))),
+        };
+        // Row TW: the width plan, on the board the flow builds, and on it without P4's
+        // zones (what L5 writes when the zones are not added).
+        // The locked vias the plan must keep, read from the live board: the planned
+        // text is stripped of all routing.
+        let live_locked = konnect_sexp::parse_sexp(&live)
+            .map_err(anyhow::Error::from)
+            .and_then(|tree| crate::specctra::locked_via_nets(&tree))
+            .unwrap_or_default();
+        let planned = width_plan_of(
+            flow,
+            &board,
+            &text,
+            rules.as_ref().ok(),
+            live_locked.clone(),
+        )
+        .and_then(|(plan, mut body)| {
+            let (unpoured, _) = if zones.is_empty() {
+                (plan.clone(), Value::Null)
+            } else {
+                width_plan_of(flow, &board, &base, rules.as_ref().ok(), live_locked)?
+            };
+            body["if_pours_skipped"] = json!({
+                "to_record": unpoured.to_record,
+                "sized": unpoured.sized.iter().map(|n| json!({
+                    "net": n.net, "current_a": n.current_a, "width_mm": n.width_mm,
+                    "via": n.via.via, "current_source": n.current_source,
+                })).collect::<Vec<_>>(),
+            });
+            Ok((plan, unpoured, body))
+        });
+        match planned {
+            Ok((plan, unpoured, body)) => {
+                flow.facts.widths_to_record = plan.to_record.len();
+                flow.facts.widths_proposed_for = record_names(&plan.to_record);
+                flow.facts.widths_to_record_unpoured = unpoured.to_record.len();
+                flow.facts.widths_proposed_for_unpoured = record_names(&unpoured.to_record);
+                if (!plan.to_record.is_empty() || !unpoured.to_record.is_empty())
+                    && flow.steps_asked.placement == RunOrSkip::Run
+                {
+                    record.not_checked.push(
+                        "the placement search routed its candidates without the proposed currents"
+                            .to_string(),
+                    );
+                }
+                if rules.is_err() {
+                    record.not_checked.push(
+                        "the width plan could not read KiCad's routing rules, so it sized no net"
+                            .to_string(),
+                    );
+                }
+                write_value(&folder.join(WIDTHS_FILE), &body)?;
+            }
+            Err(why) => return Ok(Err(Stop::new(StopKind::Failed, why))),
+        }
+        match export_check(ctx, &board, &live, &text, &folder, rules).await? {
             Ok(()) => {}
             Err(reason) => flow.facts.export_refused = Some(reason),
         }
@@ -1634,10 +1744,11 @@ async fn export_check(
     live: &str,
     text: &str,
     folder: &Path,
+    rules: Result<konnect_ipc::types::IpcEffectiveRoutingRules, String>,
 ) -> anyhow::Result<Result<(), String>> {
-    let rules = match live_input(ctx, board).await? {
-        Ok(live) => live.rules,
-        Err(refusal) => return Ok(Err(short(&body_of(&refusal)))),
+    let rules = match rules {
+        Ok(rules) => rules,
+        Err(why) => return Ok(Err(why)),
     };
     let root = folder.join(format!("export-check-{}", stamp_ms()));
     std::fs::create_dir_all(&root)?;
@@ -1659,6 +1770,103 @@ async fn export_check(
     .await?
     .map(|_| ())
     .map_err(|error| format!("{error:#}")))
+}
+
+/// Row TW: the width plan of `text` (the board the flow builds) and its gate body:
+/// the roles as gate R left them, the record as it is, the nets poured on `text`, the
+/// answer's map when there is one. `rules` `None`: KiCad's rules could not be read, and
+/// every net is `not_sized` for it. An error is the reason the flow stops.
+fn width_plan_of(
+    flow: &FlowRecord,
+    board: &Path,
+    text: &str,
+    rules: Option<&konnect_ipc::types::IpcEffectiveRoutingRules>,
+    live_locked_vias: BTreeSet<String>,
+) -> Result<(crate::width_plan::WidthPlan, Value), String> {
+    let intent = intent_of(board)?;
+    let (nets, roles) = crate::tools::pour_plan_tool::board_roles(board, text)
+        .map_err(|refusal| short(&body_of(&refusal)))?;
+    let rails = crate::pour_plan::rails_of(&roles);
+    let roles = match &flow.approvals.pour_roles {
+        Some(given) => crate::pour_plan::with_roles(&roles, given, &rails, &nets)?,
+        None => roles,
+    };
+    let tree = konnect_sexp::parse_sexp(text).map_err(|error| format!("{error:#}"))?;
+    let poured = crate::specctra::pour_nets(&tree).map_err(|error| format!("{error:#}"))?;
+    let empty = konnect_ipc::types::IpcEffectiveRoutingRules::new();
+    let given = flow
+        .approvals
+        .track_widths
+        .as_ref()
+        .and_then(WidthsAnswer::given);
+    // The locked vias that stay: the live board's, unless the answer deletes them.
+    let locked_vias = if flow.approvals.delete_routing == Some(DeleteAnswer::DeleteIncludingLocked)
+    {
+        BTreeSet::new()
+    } else {
+        live_locked_vias
+    };
+    let plan = crate::width_plan::plan(&crate::width_plan::Inputs {
+        board_text: text,
+        rules: rules.unwrap_or(&empty),
+        intent: intent.as_ref(),
+        roles: &roles,
+        poured: &poured,
+        given,
+        locked_vias: &locked_vias,
+    })
+    .map_err(|error| format!("the width plan cannot be made: {error:#}"))?;
+    let mut body = serde_json::to_value(&plan).map_err(|error| error.to_string())?;
+    body["written_to"] = json!(
+        "the design intent's currents (set_design_intent, step L5); the export then widens each net and gives it its via. KiCad's netclasses are not changed: KiCad 10 cannot assign a net to a class over IPC while the board is open"
+    );
+    Ok((plan, body))
+}
+
+/// Row TW: the names a list of records is for: a net, or `rail <name>`.
+fn record_names(records: &[crate::width_plan::Record]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| match record {
+            crate::width_plan::Record::Currents { net, .. } => net.clone(),
+            crate::width_plan::Record::Rails { rail, .. } => format!("rail {rail}"),
+        })
+        .collect()
+}
+
+/// Row TW: the records the plan file holds for the flow's answers: its `to_record`, or,
+/// when the zones are not added, its `if_pours_skipped.to_record`. An error when the file
+/// holds neither as records.
+fn planned_records(
+    flow: &FlowRecord,
+    plan: &Value,
+) -> Result<Vec<crate::width_plan::Record>, String> {
+    let value = if flow.facts.widths_unpoured(&flow.approvals)
+        && !plan["if_pours_skipped"]["to_record"].is_null()
+    {
+        &plan["if_pours_skipped"]["to_record"]
+    } else {
+        &plan["to_record"]
+    };
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("the width plan's records do not read ({error})"))
+}
+
+/// Row TW: the design intent a `get_design_intent` result holds: `None` when its source
+/// is `absent`; an error when it says `file` and its record does not read, or its source
+/// is anything else.
+fn intent_of_read(
+    read: &Value,
+) -> Result<Option<crate::tools::design_intent::DesignIntent>, String> {
+    match read["source"].as_str() {
+        Some("absent") => Ok(None),
+        Some("file") => serde_json::from_value(read["intent"].clone())
+            .map(Some)
+            .map_err(|error| format!("get_design_intent's record does not read ({error})")),
+        other => Err(format!(
+            "get_design_intent answered with source {other:?}, neither file nor absent"
+        )),
+    }
 }
 
 /// What gate A approved of the pours: every proposal's `add_zone` arguments and its
@@ -2205,6 +2413,7 @@ async fn step_work(
                 Err(halt) => Ok(Err(halt)),
             }
         }
+        Step::Widths => widths_work(flow, &board, &attempt, calls).await,
         Step::ApplySession => {
             let body = read_json(&route.join(ROUTE_FILE))?;
             let Some(mut args) = step_arguments(&body, "apply_specctra_ses") else {
@@ -2270,7 +2479,25 @@ async fn step_work(
         {
             Ok(drc) => {
                 write_value(&flow_folder(state, &flow.flow_id).join("drc.json"), &drc)?;
-                Ok(Ok(plain(counts_of(step, &drc))))
+                let mut work = plain(counts_of(step, &drc));
+                // Row TW: the routed copper against the recorded currents. A read: its
+                // refusal is not the step's, and is left for the user.
+                match calls
+                    .read("audit_trace_current", json!({ "board": board }))
+                    .await?
+                {
+                    Ok(audit) => {
+                        write_value(
+                            &flow_folder(state, &flow.flow_id).join(CURRENT_FILE),
+                            &audit,
+                        )?;
+                        work.counts["trace_current"] = trace_current_counts(&audit);
+                    }
+                    Err(Halt::Failed(why) | Halt::MayHaveChanged(why)) => work
+                        .not_checked
+                        .push(format!("audit_trace_current did not run: {why}")),
+                }
+                Ok(Ok(work))
             }
             Err(halt) => Ok(Err(halt)),
         },
@@ -2279,6 +2506,102 @@ async fn step_work(
             step.id()
         )))),
     }
+}
+
+/// Row TW: F4's count of an `audit_trace_current` result: its status, the nets checked,
+/// and its findings by severity.
+pub(crate) fn trace_current_counts(audit: &Value) -> Value {
+    let findings = audit["findings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let of = |severity: &str| {
+        findings
+            .iter()
+            .filter(|f| f["severity"] == severity)
+            .count()
+    };
+    json!({
+        "status": audit["status"],
+        "nets": audit["nets"].as_array().map_or(0, Vec::len),
+        "errors": of("error"),
+        "warnings": of("warning"),
+    })
+}
+
+/// Row TW, step L5: the confirmed currents into the design intent. Reads the record
+/// (`get_design_intent`), works out what the answer writes (`width_plan::final_records`
+/// on the plan's `to_record`, then `width_plan::sections`), and writes `rails` and then
+/// `currents`, each with the revision it read, through `set_design_intent`. The read's
+/// call file holds the record as it was: the way back, as checkpoints do not hold
+/// `.konnect/`. Nothing to write: done, with zero counts.
+async fn widths_work(
+    flow: &FlowRecord,
+    board: &Path,
+    attempt: &Path,
+    calls: &mut Calls<'_>,
+) -> anyhow::Result<Result<Work, Halt>> {
+    let plan = read_json(&attempt.join(WIDTHS_FILE))?;
+    let proposed = match planned_records(flow, &plan) {
+        Ok(proposed) => proposed,
+        Err(why) => return Ok(Err(Halt::Failed(why))),
+    };
+    let project_dir = board.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let read = match calls
+        .read("get_design_intent", json!({ "project_dir": project_dir }))
+        .await?
+    {
+        Ok(read) => read,
+        Err(halt) => return Ok(Err(halt)),
+    };
+    let intent = match intent_of_read(&read) {
+        Ok(intent) => intent,
+        Err(why) => return Ok(Err(Halt::Failed(why))),
+    };
+    let given = flow
+        .approvals
+        .track_widths
+        .as_ref()
+        .and_then(WidthsAnswer::given);
+    // The record may have changed since the answer: a given current it now holds is
+    // refused again, before anything is written.
+    if let Some(reason) = given
+        .and_then(|given| crate::width_plan::answer_refusal(given, &flow.nets, intent.as_ref()))
+    {
+        return Ok(Err(Halt::Failed(format!(
+            "{reason} (the design intent changed since gate A)"
+        ))));
+    }
+    let records = crate::width_plan::final_records(&proposed, given, intent.as_ref());
+    let (rails, currents) = crate::width_plan::sections(intent.as_ref(), &records);
+    let mut revision = read["revision"].clone();
+    for (section, value) in [
+        ("rails", rails.map(|v| json!(v))),
+        ("currents", currents.map(|v| json!(v))),
+    ] {
+        let Some(value) = value else { continue };
+        let args = json!({
+            "project_dir": project_dir,
+            "section": section,
+            "value": value,
+            "expected_revision": revision,
+        });
+        match calls.write("set_design_intent", args).await? {
+            Ok(written) => revision = written["revision"].clone(),
+            Err(halt) => return Ok(Err(halt)),
+        }
+    }
+    let count = |rails: bool| {
+        records
+            .iter()
+            .filter(|r| matches!(r, crate::width_plan::Record::Rails { .. }) == rails)
+            .count()
+    };
+    Ok(Ok(Work {
+        counts: json!({ "currents": count(false), "rails": count(true) }),
+        rounds: Vec::new(),
+        not_checked: Vec::new(),
+    }))
 }
 
 /// A new candidate path for F1, beside the route's own one, unique per attempt.
@@ -2659,6 +2982,34 @@ async fn already_done(
                 ))
             })
         }
+        Step::Widths => {
+            let Ok(plan) = read_json(&attempt.join(WIDTHS_FILE)) else {
+                return Ok(false);
+            };
+            let Ok(proposed) = planned_records(flow, &plan) else {
+                return Ok(false);
+            };
+            let project_dir = board.parent().unwrap_or(Path::new(".")).to_path_buf();
+            match io
+                .call("get_design_intent", json!({ "project_dir": project_dir }))
+                .await
+            {
+                Called::Answered(result) if !result.is_error => {
+                    let Ok(intent) = intent_of_read(&body_of(&result)) else {
+                        return Ok(false);
+                    };
+                    let given = flow
+                        .approvals
+                        .track_widths
+                        .as_ref()
+                        .and_then(WidthsAnswer::given);
+                    let records =
+                        crate::width_plan::final_records(&proposed, given, intent.as_ref());
+                    crate::width_plan::recorded(intent.as_ref(), &records)
+                }
+                _ => false,
+            }
+        }
         Step::ApplySession => routing_count(&live().await) > flow.facts.locked_routing,
         Step::LengthRules => {
             let Ok(route) = read_json(&route_folder(state, flow).join(ROUTE_FILE)) else {
@@ -2806,6 +3157,7 @@ fn gate_body(state: &Path, flow: &FlowRecord, gate: Gate) -> Value {
                     None => json!({ "passed": flow.steps_asked.routing == RunOrSkip::Run }),
                     Some(reason) => json!({ "passed": false, "reason": reason }),
                 },
+                "track_widths": file(WIDTHS_FILE),
                 "warning": "The old routing is deleted before the new routing exists; the way back is the start checkpoint.",
                 "needs": needs,
             })
@@ -3123,6 +3475,16 @@ fn apply_answer(
         return Err(CallToolResult::error(format!(
             "{reason} Nothing was changed."
         )));
+    }
+    if let Some(reason) = widths_refusal(
+        merged.track_widths.as_ref(),
+        Path::new(&flow.board),
+        &flow.nets,
+    ) {
+        return Err(invalid_arg(
+            "answer.track_widths",
+            &format!("{reason} Nothing was changed."),
+        ));
     }
     let roles_changed = gate == Gate::Plan && flow.approvals.roles_changed(given);
     // P4 planned on the board the flow will build: the winner when the placement is

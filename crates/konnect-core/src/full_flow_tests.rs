@@ -14,6 +14,10 @@ fn facts() -> PlanFacts {
         export_refused: None,
         named_only: Vec::new(),
         p4_on_winner: true,
+        widths_to_record: 0,
+        widths_proposed_for: Vec::new(),
+        widths_to_record_unpoured: 0,
+        widths_proposed_for_unpoured: Vec::new(),
     }
 }
 
@@ -24,6 +28,7 @@ fn all_approved() -> Approvals {
         pours: Some(PoursAnswer::Add),
         pour_roles: Some(RolesAnswer::AsNamed(AsNamed::AsNamed)),
         routing: Some(RoutingAnswer::ApplyIfComplete),
+        track_widths: Some(WidthsAnswer::Word(WidthsWord::AsProposed)),
     }
 }
 
@@ -97,8 +102,8 @@ fn step_ids_follow_the_design_and_serialize_as_ids() {
     assert_eq!(
         ids,
         [
-            "P0", "P1", "P2", "P3", "P4", "L1", "L2", "L3", "L4", "R1", "R2", "R3", "F1", "F2a",
-            "F2b", "F3", "F4"
+            "P0", "P1", "P2", "P3", "P4", "L1", "L2", "L3", "L4", "L5", "R1", "R2", "R3", "F1",
+            "F2a", "F2b", "F3", "F4"
         ]
     );
     for step in Step::ALL {
@@ -110,7 +115,10 @@ fn step_ids_follow_the_design_and_serialize_as_ids() {
         .filter(|s| s.writes())
         .map(|s| s.id())
         .collect();
-    assert_eq!(writing, ["L2", "L3", "L4", "F1", "F2a", "F2b", "F3", "F4"]);
+    assert_eq!(
+        writing,
+        ["L2", "L3", "L4", "L5", "F1", "F2a", "F2b", "F3", "F4"]
+    );
 }
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
@@ -596,6 +604,7 @@ fn resume_only_saves_again_an_unsaved_step() {
 fn everything_approved_runs_every_step_in_order() {
     let mut flow = flow();
     flow.approvals = all_approved();
+    flow.facts.widths_to_record = 1;
     flow.put(StepRecord::new(Step::Preflight, StepState::Done));
     // The route's facts arrive with R2; here they are known from the start.
     flow.route = Some(RouteFacts {
@@ -1036,4 +1045,217 @@ fn keeping_routing_with_as_much_locked_as_unlocked_says_keep() {
         why_skipped(&flow, Step::DeleteRouting).as_deref(),
         Some("delete_routing: keep")
     );
+}
+
+// ─── Row TW: the track widths ────────────────────────────────────────────────
+
+/// TW-M1: gate A asks `track_widths` only when routing runs, the plan proposes a current
+/// and the key is not answered; recommended `as_proposed`, naming the nets.
+#[test]
+fn gate_a_asks_track_widths_only_when_a_current_is_proposed() {
+    let mut facts = facts();
+    facts.widths_to_record = 2;
+    facts.widths_proposed_for = vec!["12V".to_string(), "5V".to_string()];
+    let mut approved = all_approved();
+    approved.track_widths = None;
+    let steps = Steps::default();
+    let need = needs_at_plan(&facts, &steps, &approved)
+        .into_iter()
+        .find(|need| need.key == "track_widths")
+        .expect("asked");
+    assert_eq!(need.recommended, Some(json!("as_proposed")));
+    assert!(need.why.contains("12V, 5V"), "{}", need.why);
+    // Not asked: answered, nothing proposed, or no routing.
+    let asked = |facts: &PlanFacts, steps: &Steps, approved: &Approvals| {
+        needs_at_plan(facts, steps, approved)
+            .iter()
+            .any(|need| need.key == "track_widths")
+    };
+    assert!(!asked(&facts, &steps, &all_approved()));
+    let none = PlanFacts {
+        widths_to_record: 0,
+        ..facts.clone()
+    };
+    assert!(!asked(&none, &steps, &approved));
+    let mut no_routing = approved.clone();
+    no_routing.routing = Some(RoutingAnswer::Skip);
+    assert!(!asked(&facts, &steps, &no_routing));
+    let skip_steps = Steps {
+        routing: RunOrSkip::Skip,
+        ..Steps::default()
+    };
+    assert!(!asked(&facts, &skip_steps, &approved));
+}
+
+/// TW-M2: L5's skip reasons: routing off, nothing to record (a map still runs it), skip.
+#[test]
+fn l5_is_skipped_for_each_reason_and_runs_otherwise() {
+    let reason = |flow: &FlowRecord| skip_reason(Step::Widths, flow);
+    let mut flow = flow();
+    flow.approvals = all_approved();
+    flow.facts.widths_to_record = 1;
+    assert_eq!(reason(&flow), None);
+    flow.approvals.track_widths = Some(WidthsAnswer::Word(WidthsWord::Skip));
+    assert_eq!(reason(&flow).as_deref(), Some("track_widths: skip"));
+    flow.approvals.track_widths = None;
+    assert_eq!(reason(&flow).as_deref(), Some("track_widths: skip"));
+    flow.facts.widths_to_record = 0;
+    flow.approvals.track_widths = Some(WidthsAnswer::Word(WidthsWord::AsProposed));
+    assert!(reason(&flow).unwrap().contains("recorded already"));
+    flow.approvals.track_widths = Some(WidthsAnswer::Map(
+        [("S1".to_string(), 2.0)].into_iter().collect(),
+    ));
+    assert_eq!(reason(&flow), None, "a given current is written");
+    flow.approvals.routing = Some(RoutingAnswer::Skip);
+    assert_eq!(reason(&flow).as_deref(), Some("routing: skip"));
+}
+
+/// TW-M3: `track_widths` reads its three forms, is set once, and a second value is
+/// refused naming it.
+#[test]
+fn track_widths_reads_its_forms_and_is_set_once() {
+    let read = |value: Value| -> Approvals {
+        serde_json::from_value(json!({ "track_widths": value })).unwrap()
+    };
+    assert_eq!(
+        read(json!("as_proposed")).track_widths,
+        Some(WidthsAnswer::Word(WidthsWord::AsProposed))
+    );
+    assert_eq!(
+        read(json!("skip")).track_widths,
+        Some(WidthsAnswer::Word(WidthsWord::Skip))
+    );
+    let map = read(json!({ "12V": 2.5 }));
+    assert_eq!(
+        map.track_widths.as_ref().and_then(WidthsAnswer::given),
+        Some(&[("12V".to_string(), 2.5)].into_iter().collect())
+    );
+    assert!(serde_json::from_value::<Approvals>(json!({ "track_widths": "yes" })).is_err());
+    let skip = read(json!("skip"));
+    let refused = map.merged(&skip, Gate::Plan).unwrap_err();
+    assert!(refused.contains("track_widths"), "{refused}");
+    assert_eq!(
+        map.merged(&map, Gate::Plan).unwrap(),
+        map,
+        "the same value again"
+    );
+    assert_eq!(Approvals::default().merged(&map, Gate::Plan).unwrap(), map);
+    assert!(WidthsAnswer::Word(WidthsWord::AsProposed).records());
+    assert!(!WidthsAnswer::Word(WidthsWord::Skip).records());
+}
+
+/// TW-M4: L5's counts and its summary line.
+#[test]
+fn l5_counts_and_line() {
+    assert_eq!(
+        counts_of(Step::Widths, &json!({ "currents": 2, "rails": 1 })),
+        json!({ "currents": 2, "rails": 1 })
+    );
+    let mut record = StepRecord::new(Step::Widths, StepState::Done);
+    record.counts = json!({ "currents": 2, "rails": 0 });
+    assert_eq!(
+        line_of(&record).as_deref(),
+        Some("Track widths recorded: done (currents 2, rails 0).")
+    );
+    assert_eq!(
+        line_of(&StepRecord::skipped(Step::Widths, "track_widths: skip")),
+        None,
+        "a skipped L5 takes no summary line"
+    );
+}
+
+/// Review R1 major 2: gate A asks `track_widths` when only the plan without the zones
+/// proposes a current, and L5's count follows the `pours` answer.
+#[test]
+fn track_widths_follows_the_pours_answer() {
+    let mut facts = facts();
+    facts.widths_to_record_unpoured = 1;
+    facts.widths_proposed_for_unpoured = vec!["GND".to_string()];
+    let mut approved = all_approved();
+    approved.track_widths = None;
+    // Review R2 C: with pours: add answered, nothing is written, so nothing is asked.
+    let asked = |approved: &Approvals| {
+        needs_at_plan(&facts, &Steps::default(), approved)
+            .into_iter()
+            .find(|need| need.key == "track_widths")
+    };
+    assert!(asked(&approved).is_none());
+    assert_eq!(
+        facts.widths_for(&approved).0,
+        0,
+        "pours: add writes nothing"
+    );
+    // The pours not answered yet: asked, naming what pours: skip would write.
+    let mut open = approved.clone();
+    open.pours = None;
+    let need = asked(&open).expect("asked while the pours are open");
+    assert!(need.why.contains("pours: skip"), "{}", need.why);
+    // Review R2 C, the other side: only the plan with the zones proposes a current, and
+    // the pours are open: still asked, since pours: add would write it.
+    let mut poured_only = facts.clone();
+    poured_only.widths_to_record = 1;
+    poured_only.widths_proposed_for = vec!["12V".to_string()];
+    poured_only.widths_to_record_unpoured = 0;
+    poured_only.widths_proposed_for_unpoured = Vec::new();
+    assert!(needs_at_plan(&poured_only, &Steps::default(), &open)
+        .iter()
+        .any(|need| need.key == "track_widths"));
+    approved.pours = Some(PoursAnswer::Skip);
+    assert_eq!(facts.widths_for(&approved).0, 1);
+    let mut flow = flow();
+    flow.facts = facts;
+    flow.approvals = all_approved();
+    assert!(skip_reason(Step::Widths, &flow)
+        .unwrap()
+        .contains("recorded already"));
+    flow.approvals.pours = Some(PoursAnswer::Skip);
+    assert_eq!(skip_reason(Step::Widths, &flow), None);
+}
+
+/// Mutants of `needs_at_plan`'s `track_widths` need (job 21032): no zones means one plan,
+/// so nothing is undecided; the question names the nets of the plan that applies, and
+/// mentions `pours: skip` only when there are zones and it changes the nets.
+#[test]
+fn the_track_widths_question_names_the_plan_that_applies() {
+    let mut open = all_approved();
+    open.track_widths = None;
+    open.pours = None;
+    let need = |facts: &PlanFacts| {
+        needs_at_plan(facts, &Steps::default(), &open)
+            .into_iter()
+            .find(|need| need.key == "track_widths")
+    };
+    let base = PlanFacts {
+        widths_to_record: 1,
+        widths_proposed_for: vec!["12V".to_string()],
+        widths_to_record_unpoured: 0,
+        widths_proposed_for_unpoured: Vec::new(),
+        ..facts()
+    };
+    // No zones: the plan without them is the only one, and it proposes nothing.
+    let no_zones = PlanFacts {
+        zones: 0,
+        ..base.clone()
+    };
+    assert!(need(&no_zones).is_none());
+    // Zones, the pours open: asked, naming the poured plan's nets.
+    let why = need(&base).unwrap().why;
+    assert!(why.contains("for 12V"), "{why}");
+    assert!(why.contains("With pours: skip it proposes none."), "{why}");
+    // Both plans name the same nets: no pours: skip sentence.
+    let same = PlanFacts {
+        widths_to_record_unpoured: 1,
+        widths_proposed_for_unpoured: vec!["12V".to_string()],
+        ..base.clone()
+    };
+    let why = need(&same).unwrap().why;
+    assert!(!why.contains("pours: skip"), "{why}");
+    // The unpoured plan applies (pours open) and proposes its own nets: they are named.
+    let other = PlanFacts {
+        widths_to_record_unpoured: 1,
+        widths_proposed_for_unpoured: vec!["GND".to_string()],
+        ..base.clone()
+    };
+    let why = need(&other).unwrap().why;
+    assert!(why.starts_with("No current is recorded for GND"), "{why}");
 }

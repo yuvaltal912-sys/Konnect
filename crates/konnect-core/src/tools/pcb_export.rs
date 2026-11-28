@@ -346,7 +346,7 @@ fn export_tools() -> Vec<ToolDef> {
                     "widths_from_intent": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. A net owning a copper pour keeps its effective class width even when pours are omitted; this does not verify pour capacity. intent_widths reports the width decision and reason."
+                        "description": "Widen each net with a current in the design-intent record (get_design_intent: currents, and rails with max_current_a) to the IPC-2221 width for that current, on the stack's worst layer, as audit_trace_current computes it. Never narrows a net. A net owning a copper pour keeps its effective class width and via even when pours are omitted; this does not verify pour capacity. A widened or already wide enough net whose class via cannot carry its current gets a 0.8/0.4 mm via (never a smaller one, and not on a net with locked vias). intent_widths reports the width and via decisions, vias_per_layer_change, and the reasons."
                     },
                     "allow_duplicate_references": {
                         "type": "boolean",
