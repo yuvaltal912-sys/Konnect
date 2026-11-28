@@ -29,6 +29,7 @@ pub(crate) mod place_search;
 pub(crate) mod pour_check;
 pub(crate) mod pour_damage;
 pub(crate) mod pour_plan;
+pub(crate) mod width_plan;
 pub(crate) mod pour_prune;
 pub(crate) mod pour_rank;
 pub(crate) mod pour_stitch;

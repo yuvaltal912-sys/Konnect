@@ -446,21 +446,58 @@ fn hole_keepout_growth(hole_clearance_um: Option<i64>, class_nets: &RuleGroups) 
     Some((hole - smallest).max(0))
 }
 
+/// Row TW: the copper layers the router may put a track on, outermost first: the
+/// layers the export writes as `signal`.
+pub(crate) fn routing_layers(tree: &SexpNode) -> Result<Vec<String>> {
+    Ok(copper_stack(tree)?
+        .into_iter()
+        .filter(|(_, kind)| *kind == "signal")
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Row TW: the nets that own a copper pour of the board, as the export reads its zones
+/// (rule areas and teardrops are not pours).
+pub(crate) fn pour_nets(tree: &SexpNode) -> Result<BTreeSet<String>> {
+    Ok(zones(tree, &top_level_net_table(tree), &copper_layers(tree)?)?
+        .into_iter()
+        .filter(|zone| zone.kind == ZoneKind::Plane)
+        .filter_map(|zone| zone.net)
+        .collect())
+}
+
+/// Row TW: the nets that have a locked via, as the export reads its locked routing.
+pub(crate) fn locked_via_nets(tree: &SexpNode) -> Result<BTreeSet<String>> {
+    Ok(
+        locked_routing(tree, &top_level_net_table(tree), &copper_layers(tree)?)?
+            .vias
+            .into_iter()
+            .map(|via| via.net)
+            .collect(),
+    )
+}
+
 /// Each net with a design-intent current, widened to the IPC-2221 width for
 /// that current on the worst copper layer of the stack (inner layers need more
 /// copper), with copper thickness from the record, else the stackup, else
-/// 1 oz / 0.5 oz, as `audit_trace_current` computes it. A net is never made
-/// narrower. Nets owning a copper pour keep their effective class width,
-/// including when the caller omits pours from the DSN. This is a routing
-/// policy, not a check of the pour's current capacity. With no record nothing
-/// changes; an unusable record refuses.
+/// 1 oz / 0.5 oz, as `audit_trace_current` computes it
+/// (`width_plan::needed_width_mm`). A net is never made narrower. Nets owning a
+/// copper pour keep their effective class width and via, including when the
+/// caller omits pours from the DSN. This is a routing policy, not a check of the
+/// pour's current capacity. Row TW: a net that is widened or already wide enough
+/// also gets `width_plan::POWER_VIA` when one via of its class cannot carry its
+/// current (`width_plan::via_for_current`), unless the net has locked vias (the
+/// export requires a locked via to equal its net's rule): `via_from_mm` and
+/// `via_to_mm` say so, and `vias_per_layer_change` how many a layer change needs.
+/// With no record nothing changes; an unusable record refuses.
 pub(crate) fn widen_for_intent(
     board: &Path,
     source: &str,
     rules: &IpcEffectiveRoutingRules,
 ) -> Result<(IpcEffectiveRoutingRules, Vec<serde_json::Value>)> {
     use crate::tools::design_intent::{design_intent_path, read_design_intent, IntentRead};
-    use crate::tools::trace_current::{copper_for, is_outer, required_area_mm2, requirements};
+    use crate::tools::trace_current::{copper_for, requirements};
+    use crate::width_plan::{needed_width_mm, via_for_current, vias_needed, ViaSize};
     let dir = board.parent().unwrap_or(Path::new("."));
     let path = design_intent_path(dir);
     let intent = match read_design_intent(&path) {
@@ -472,19 +509,11 @@ pub(crate) fn widen_for_intent(
         IntentRead::Loaded { intent, .. } => intent,
     };
     let tree = parse_sexp(source).context("parse board for intent widths")?;
-    let pour_nets: BTreeSet<String> =
-        zones(&tree, &top_level_net_table(&tree), &copper_layers(&tree)?)?
-            .into_iter()
-            .filter(|zone| zone.kind == ZoneKind::Plane)
-            .filter_map(|zone| zone.net)
-            .collect();
+    let pour_nets = pour_nets(&tree)?;
     // Only layers the router may put a track on decide the width.
-    let layers: Vec<String> = copper_stack(&tree)?
-        .into_iter()
-        .filter(|(_, kind)| *kind == "signal")
-        .map(|(name, _)| name)
-        .collect();
+    let layers = routing_layers(&tree)?;
     let copper = copper_for(&tree, &intent);
+    let locked_via_nets = locked_via_nets(&tree)?;
     let mut out = rules.clone();
     let mut report = Vec::new();
     for req in requirements(&intent, 10.0, false) {
@@ -495,21 +524,7 @@ pub(crate) fn widen_for_intent(
             }));
             continue;
         };
-        let (needed, limiting) = layers
-            .iter()
-            .map(|layer| {
-                let (t, _) = copper.thickness(layer);
-                (
-                    required_area_mm2(req.amps, req.rise_c, is_outer(layer)) / t,
-                    layer.clone(),
-                )
-            })
-            .fold(
-                (0.0f64, String::new()),
-                |a, b| if b.0 > a.0 { b } else { a },
-            );
-        // Up to the next whole micrometre, so the DSN never rounds it below.
-        let needed = (needed * 1000.0).ceil() / 1000.0;
+        let (needed, limiting) = needed_width_mm(req.amps, req.rise_c, &layers, &copper);
         // A rule with no track width is incomplete: leave it as it is so the
         // export refuses it, instead of filling the gap with the needed width.
         let Some(from) = rule.track_width_mm else {
@@ -527,18 +542,46 @@ pub(crate) fn widen_for_intent(
             }));
             continue;
         }
-        if needed > from + 1e-9 {
+        let mut row = if needed > from + 1e-9 {
             rule.track_width_mm = Some(needed);
-            report.push(serde_json::json!({
+            serde_json::json!({
                 "net": req.net, "current_a": req.amps, "temp_rise_c": req.rise_c,
                 "from_mm": from, "to_mm": needed, "limiting_layer": limiting, "status": "widened",
-            }));
+            })
         } else {
-            report.push(serde_json::json!({
+            serde_json::json!({
                 "net": req.net, "current_a": req.amps, "temp_rise_c": req.rise_c,
                 "width_mm": from, "needed_mm": needed, "status": "already_wide_enough",
-            }));
+            })
+        };
+        // Row TW: the via. A rule with no via is incomplete and left for the export to
+        // refuse, as above.
+        if let (Some(diameter), Some(drill)) = (rule.via_diameter_mm, rule.via_drill_mm) {
+            let class = ViaSize {
+                diameter_mm: diameter,
+                drill_mm: drill,
+            };
+            let choice = via_for_current(req.amps, req.rise_c, class);
+            if choice.changed && locked_via_nets.contains(&req.net) {
+                row["via_kept_reason"] = serde_json::json!(
+                    "the net has locked vias, which must equal its rule; its class via is kept"
+                );
+                row["vias_per_layer_change"] = serde_json::json!(vias_needed(
+                    req.amps,
+                    crate::tools::trace_current::via_capacity_a(drill, req.rise_c)
+                ));
+            } else {
+                if choice.changed {
+                    rule.via_diameter_mm = Some(choice.via.diameter_mm);
+                    rule.via_drill_mm = Some(choice.via.drill_mm);
+                    row["via_from_mm"] = serde_json::json!([diameter, drill]);
+                    row["via_to_mm"] =
+                        serde_json::json!([choice.via.diameter_mm, choice.via.drill_mm]);
+                }
+                row["vias_per_layer_change"] = serde_json::json!(choice.per_layer_change);
+            }
         }
+        report.push(row);
     }
     Ok((out, report))
 }
@@ -2373,6 +2416,9 @@ pub(crate) struct PadPin {
     /// The DSN writes the pad as a `circle` (a KiCad circle, or an oval of equal sides
     /// in whole micrometres).
     pub dsn_round: bool,
+    /// Row TW: the smaller side of the pad's copper as the DSN writes it (for a custom
+    /// pad, of the pin's bounding box), µm.
+    pub min_size_um: i64,
 }
 
 impl PadPin {
@@ -2401,6 +2447,7 @@ pub(crate) fn pad_pins(tree: &SexpNode) -> Result<Vec<PadPin>> {
                 footprint_uuid: footprint.kiid.clone(),
                 pad_uuid: pad.uuid.clone(),
                 dsn_round: pad.padstack.shape == PadShape::Circle,
+                min_size_um: pad.padstack.size_x_um.min(pad.padstack.size_y_um),
             })
         })
         .collect())

@@ -60,7 +60,7 @@ pub struct DesignIntent {
 }
 
 impl DesignIntent {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             rails: Vec::new(),

@@ -4,6 +4,25 @@ Konnect's tool schemas are public API. This file records intentional argument
 removals, default changes and the supported replacement workflow.
 
 
+## Unreleased: track widths in the full flow (Row TW)
+
+**Additive; nothing removed or renamed.** Design: `docs/TRACK_WIDTH_PLAN_DESIGN.md`.
+
+- `run_full_flow`: `approve` and `answer` take `track_widths`: `"as_proposed"`, `"skip"`, or a
+  map of net to current in A (above 0, at most 100). Gate A's body has `track_widths` (the
+  width plan: `sized`, `not_sized`, `classes`, `signals`, `differential_pairs`, `to_record`,
+  `copper`, `notes`, `written_to`) and asks `track_widths` when routing runs and the plan
+  proposes a current. A map naming a net with no pad, a net whose current the design intent
+  records, or two nets of one rail with two values is refused. A new live step L5 ("Track
+  widths recorded") writes the confirmed currents with `set_design_intent` (`rails` and/or
+  `currents`) before the export. F4's counts gain `trace_current` (`status`, `nets`,
+  `errors`, `warnings`) from `audit_trace_current`; its file is `trace-current.json`.
+- `export_specctra_dsn` with `widths_from_intent` (the default): a widened or already wide
+  enough net whose class via cannot carry its current gets a 0.8/0.4 mm via, never a
+  smaller one, and not on a net with locked vias. Its `intent_widths` rows may carry
+  `via_from_mm`, `via_to_mm`, `vias_per_layer_change` and `via_kept_reason`. A board whose
+  supplies need no new via exports exactly as before.
+
 ## Unreleased: effort `xh` is 22 minutes
 
 A default change, no argument change. The `xh` routing budget of `route_specctra_dsn`
